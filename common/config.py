@@ -1,0 +1,74 @@
+"""所有组件共用的配置读取入口。
+
+只读环境变量（配合 .env），不做业务逻辑。任何组件（gateway / orchestration /
+engines / tools）都应该 `from common.config import settings` 而不是自己读 os.environ，
+避免同一个变量在不同地方有不同默认值。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+
+# 允许在仓库根目录放一份 .env，本地跑脚本时自动加载；容器里通常直接由
+# docker-compose 的 environment 注入，load_dotenv 找不到文件时是no-op。
+load_dotenv()
+
+
+def _env(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+
+@dataclass(frozen=True)
+class Settings:
+    # MinIO
+    minio_endpoint: str = field(default_factory=lambda: _env("MINIO_ENDPOINT", "http://localhost:9000"))
+    minio_root_user: str = field(default_factory=lambda: _env("MINIO_ROOT_USER", "minioadmin"))
+    minio_root_password: str = field(default_factory=lambda: _env("MINIO_ROOT_PASSWORD", "minioadmin123"))
+    minio_bucket: str = field(default_factory=lambda: _env("MINIO_BUCKET", "lake"))
+
+    # Lance（样本本体，README 组件清单：本地/MinIO 后端二选一，MVP 默认本地磁盘）
+    lance_root: str = field(default_factory=lambda: _env("LANCE_ROOT", "./data/lance"))
+
+    # Postgres
+    postgres_host: str = field(default_factory=lambda: _env("POSTGRES_HOST", "localhost"))
+    postgres_port: int = field(default_factory=lambda: int(_env("POSTGRES_PORT", "5432")))
+    postgres_user: str = field(default_factory=lambda: _env("POSTGRES_USER", "edp"))
+    postgres_password: str = field(default_factory=lambda: _env("POSTGRES_PASSWORD", "edp123"))
+    postgres_dagster_db: str = field(default_factory=lambda: _env("POSTGRES_DAGSTER_DB", "dagster"))
+    postgres_platform_db: str = field(default_factory=lambda: _env("POSTGRES_PLATFORM_DB", "platform"))
+
+    # Kafka
+    kafka_bootstrap: str = field(default_factory=lambda: _env("KAFKA_BOOTSTRAP", "localhost:9094"))
+    kafka_topic: str = field(default_factory=lambda: _env("KAFKA_TOPIC", "edp.events"))
+
+    # Iceberg REST catalog
+    iceberg_rest_uri: str = field(default_factory=lambda: _env("ICEBERG_REST_URI", "http://localhost:8181"))
+    iceberg_warehouse: str = field(default_factory=lambda: _env("ICEBERG_WAREHOUSE", "s3://lake/warehouse"))
+    iceberg_catalog_name: str = field(default_factory=lambda: _env("ICEBERG_CATALOG_NAME", "edp"))
+
+    # Gateway / Dagster
+    gateway_host: str = field(default_factory=lambda: _env("GATEWAY_HOST", "0.0.0.0"))
+    gateway_port: int = field(default_factory=lambda: int(_env("GATEWAY_PORT", "8000")))
+    dagster_host: str = field(default_factory=lambda: _env("DAGSTER_HOST", "localhost"))
+    dagster_port: int = field(default_factory=lambda: int(_env("DAGSTER_PORT", "3000")))
+
+    log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
+
+    @property
+    def platform_dsn(self) -> str:
+        return (
+            f"postgresql://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_platform_db}"
+        )
+
+    def s3_client_kwargs(self) -> dict:
+        return dict(
+            endpoint_url=self.minio_endpoint,
+            aws_access_key_id=self.minio_root_user,
+            aws_secret_access_key=self.minio_root_password,
+        )
+
+
+settings = Settings()

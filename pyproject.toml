@@ -1,0 +1,50 @@
+[project]
+name = "edp"
+version = "0.1.0"
+description = "EDP —— 数据平台 MVP（对标《云平台及遥操设计》第四节的最小可运行骨架）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # 编排
+    "dagster>=1.8,<1.9",
+    "dagster-webserver>=1.8,<1.9",
+    "dagster-postgres>=0.24,<0.25",
+    "dagster-graphql>=1.8,<1.9",
+    # 接入网关
+    "fastapi>=0.112",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    # 存储 / 表格式客户端
+    "pyiceberg[pyarrow,s3fs]>=0.7,<0.8",
+    "pyarrow>=15,<17",
+    "boto3>=1.34",
+    "psycopg[binary]>=3.1",
+    "kafka-python-ng>=2.2",
+    # 执行引擎
+    "duckdb>=1.0",
+    "ray[default]>=2.30",
+    "pyspark>=3.5,<3.6",
+    # 数据格式 / 工具
+    "mcap>=1.1",
+    "pylance>=0.19",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "click>=8.1",
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
