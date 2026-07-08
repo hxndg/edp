@@ -62,6 +62,7 @@ def run(*, run_id: str, strategy_id: str | None = None) -> dict:
 
     from common.audit import make_batch_id
     from common.iceberg import with_audit_columns, upsert
+    from common.saga import uncommitted_episode_ids
     from common.strategy_registry import run_strategy
     from engines.duckdb.duckdb_conn import iceberg_arrow, query
     from schemas.iceberg_tables import ENTITY_TAG
@@ -70,9 +71,17 @@ def run(*, run_id: str, strategy_id: str | None = None) -> dict:
     if samples_arrow.num_rows == 0:
         return {"num_tags": 0, "strategy_id": None}
 
+    # 读侧过滤（docs/saga-consistency-guide.md）：ingest saga 还没走到终态 done 的
+    # 批次，其 sample 行可能是半成品/失败残留/正在被 correct 重写，先隔离不消费。
+    excluded = pa.table({"episode_id": pa.array(uncommitted_episode_ids(), type=pa.string())})
     samples_df = query(
-        "SELECT sample_id, robot_id, quality_score FROM samples WHERE sample_id IS NOT NULL",
+        """
+        SELECT sample_id, robot_id, quality_score FROM samples
+        WHERE sample_id IS NOT NULL
+          AND episode_id NOT IN (SELECT episode_id FROM excluded_episodes)
+        """,
         samples=samples_arrow,
+        excluded_episodes=excluded,
     )
 
     strategy, tag_rows = run_strategy("entity_tag", strategy_id, samples_df)

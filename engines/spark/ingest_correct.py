@@ -7,14 +7,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-import pandas as pd
 import pyarrow as pa
 from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, LessThanOrEqual
 
 from common import object_store
 from common.audit import make_batch_id
 from common.db import execute, fetch_one, to_json
-from common.iceberg import append, in_filter, load_table, upsert, with_audit_columns
+from common.iceberg import in_filter, load_table, replace_where, upsert, with_audit_columns
+from common.saga import Saga, SagaOwnershipLostError
 from common.strategy_registry import run_strategy
 from engines.spark.ingest_common import (
     bucket_by_window,
@@ -37,14 +37,34 @@ logger = logging.getLogger(__name__)
 
 
 def run(upload_id: str, run_id: str) -> dict:
+    """Saga 外壳与 ingest_append.run 相同（docs/saga-consistency-guide.md）：
+    claim 互斥 → 分步 advance（心跳 + fencing）→ 显式 SUCCEEDED/FAILED 终态。
+    """
     session = fetch_one("SELECT * FROM upload_session WHERE upload_id = %s", (upload_id,))
     if session is None:
         raise ValueError(f"upload_session '{upload_id}' 不存在")
     if session["manifest_op"] != "correct":
         raise ValueError(f"upload_session '{upload_id}' 的 manifest_op 不是 correct")
 
+    saga = Saga("ingest_correct", upload_id, run_id)
+    saga.claim()
     execute("UPDATE upload_session SET status = 'ingesting', updated_at = now() WHERE upload_id = %s", (upload_id,))
 
+    try:
+        result = _execute(session, upload_id, run_id, saga)
+    except SagaOwnershipLostError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if saga.fail(f"{type(e).__name__}: {e}"):
+            execute("UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = %s", (upload_id,))
+        raise
+
+    saga.succeed()
+    execute("UPDATE upload_session SET status = 'done', updated_at = now() WHERE upload_id = %s", (upload_id,))
+    return result
+
+
+def _execute(session: dict, upload_id: str, run_id: str, saga: Saga) -> dict:
     manifest = session["manifest"]
     episode_id = manifest["episode_id"]
     affected_start = datetime.fromisoformat(manifest["affected_start_ts"])
@@ -64,6 +84,7 @@ def run(upload_id: str, run_id: str) -> dict:
     episode_start_ts = episode["start_ts"]
 
     # 1) 重新解析这次提交的文件（只覆盖 affected 范围）
+    saga.advance("PARSE")
     raw_file_rows: list[dict] = []
     bronze_payload_rows: list[dict] = []
     for entry in manifest["files"]:
@@ -95,42 +116,47 @@ def run(upload_id: str, run_id: str) -> dict:
         tbl = pa.Table.from_pylist(rows)
         return with_audit_columns(tbl, batch_id=batch_id, run_id=run_id, source_uri=f"upload:{upload_id}")
 
+    saga.advance("RAW_INDEX")
     tbl = _prep(raw_file_rows)
     if tbl is not None:
         upsert(RAW_FILE, tbl, join_cols=["file_uri"])
 
-    # 2) 范围限定覆盖：只 delete + 重写受影响的时间窗，不动分区外的历史数据（README 4.6）
+    # 2) 范围限定覆盖（README 4.6）：delete 受影响时间窗 + append 修正数据必须原子，
+    #    否则并发读者会在两次 commit 之间看到"旧数据没了、新数据还没来"的空洞——
+    #    这正是用户担心的"sensor 定时重试与读端并发"场景，replace_where 用
+    #    pyiceberg transaction 把两步合成单次快照提交解决。
     range_filter = And(
         EqualTo("episode_id", episode_id),
         GreaterThanOrEqual("ts", affected_start),
         LessThanOrEqual("ts", affected_end),
     )
-    load_table("bronze_imu").delete(delete_filter=range_filter)
-    tbl = _prep(
-        [
-            {
-                "episode_id": episode_id,
-                "robot_id": robot_id,
-                "source_file": manifest["files"][0]["file_uri"],
-                "seq": i,
-                "ts": r["ts"],
-                "payload_json": to_json(r["payload"]),
-            }
-            for i, r in enumerate(bronze_payload_rows)
-        ]
+    saga.advance("BRONZE")
+    replace_where(
+        "bronze_imu",
+        range_filter,
+        _prep(
+            [
+                {
+                    "episode_id": episode_id,
+                    "robot_id": robot_id,
+                    "source_file": manifest["files"][0]["file_uri"],
+                    "seq": i,
+                    "ts": r["ts"],
+                    "payload_json": to_json(r["payload"]),
+                }
+                for i, r in enumerate(bronze_payload_rows)
+            ]
+        ),
     )
-    if tbl is not None:
-        append("bronze_imu", tbl)
 
     strategy, silver_rows = run_strategy("silver_clean", None, bronze_payload_rows)
 
-    load_table("silver_imu").delete(delete_filter=range_filter)
+    saga.advance("SILVER")
     silver_table_rows = [{**r, "episode_id": episode_id, "robot_id": robot_id} for r in silver_rows]
-    tbl = _prep(silver_table_rows)
-    if tbl is not None:
-        append("silver_imu", tbl)
+    replace_where("silver_imu", range_filter, _prep(silver_table_rows))
 
     # 3) 重新切片受影响的窗口；window_index 用绝对时间锚点计算，天然命中原来的 sample_id
+    saga.advance("SAMPLES")
     windows = bucket_by_window(silver_rows, episode_start_ts=episode_start_ts)
     sample_rows = []
     gold_rows = []
@@ -164,10 +190,9 @@ def run(upload_id: str, run_id: str) -> dict:
         upsert(GOLD_SAMPLE_INDEX, tbl, join_cols=["sample_id"])
 
     # 4) 受影响 sample 的 annotation/qc_result 置为 pending，重新进入 3.2.2 标注流程
+    saga.advance("RESET_DOWNSTREAM")
     num_reset_annotations = _reset_to_pending(ANNOTATION, "target_id", affected_sample_ids, {"review_status": "pending"}, "anno_id", batch_id, run_id, upload_id)
     num_reset_qc = _reset_to_pending(QC_RESULT, "target_id", affected_sample_ids, {"verdict": "need_review"}, "qc_id", batch_id, run_id, upload_id)
-
-    execute("UPDATE upload_session SET status = 'done', updated_at = now() WHERE upload_id = %s", (upload_id,))
 
     return {
         "episode_id": episode_id,

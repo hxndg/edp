@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from common.audit import make_batch_id
 from common.iceberg import upsert, with_audit_columns
+from common.saga import uncommitted_episode_ids
 from engines.duckdb.duckdb_conn import iceberg_arrow, query
 from schemas.iceberg_tables import ANALYTICS_SUMMARY
 
@@ -26,14 +27,26 @@ def run(*, run_id: str) -> dict:
     metrics: list[dict] = []
     now = datetime.now(timezone.utc)
 
+    # 读侧过滤（docs/saga-consistency-guide.md）：未到 done 终态的批次不计入指标，
+    # 避免半成品数据把 total/avg 拉偏。
+    excluded = pa.table({"episode_id": pa.array(uncommitted_episode_ids(), type=pa.string())})
+
     if episodes.num_rows:
-        df = query("SELECT COUNT(*) AS n FROM episodes", episodes=episodes)
+        df = query(
+            "SELECT COUNT(*) AS n FROM episodes WHERE episode_id NOT IN (SELECT episode_id FROM excluded_episodes)",
+            episodes=episodes,
+            excluded_episodes=excluded,
+        )
         metrics.append(("episode", "total_episodes", float(df["n"][0])))
 
     if samples.num_rows:
         df = query(
-            "SELECT COUNT(*) AS n, AVG(quality_score) AS avg_q FROM samples",
+            """
+            SELECT COUNT(*) AS n, AVG(quality_score) AS avg_q FROM samples
+            WHERE episode_id NOT IN (SELECT episode_id FROM excluded_episodes)
+            """,
             samples=samples,
+            excluded_episodes=excluded,
         )
         metrics.append(("sample", "total_samples", float(df["n"][0])))
         metrics.append(("sample", "avg_quality_score", float(df["avg_q"][0] or 0.0)))

@@ -5,14 +5,16 @@ from dagster import DefaultScheduleStatus, RunRequest, ScheduleEvaluationContext
 
 from orchestration.compaction import compaction_job
 from orchestration.jobs import ingest_append_job, ingest_correct_job
-from orchestration.sensors import _pending_upload_ids
+from orchestration.sensors import _pending_upload_rows, _run_key
 
 
 def _fallback_run_requests(context: ScheduleEvaluationContext, manifest_op: str):
-    for upload_id in _pending_upload_ids(manifest_op):
-        # run_key 跟 sensor 用同一个命名规则：即使 sensor 已经先一步触发过，
-        # Dagster 也会因为 run_key 重复而跳过，天然幂等，不会重复处理。
-        yield RunRequest(run_key=f"{manifest_op}-{upload_id}", partition_key=upload_id)
+    for row in _pending_upload_rows(manifest_op):
+        # run_key 跟 sensor 用同一个生成规则（op-upload_id-updated_at）：即使 sensor
+        # 已经先一步触发过，Dagster 也会因为 run_key 重复而跳过，天然幂等。
+        # 就算去重被绕过（比如刚好跨在 updated_at 刷新点上），引擎侧 saga.claim()
+        # 的 CAS 互斥也保证同一个 upload 只有一个写者（docs/saga-consistency-guide.md）。
+        yield RunRequest(run_key=_run_key(manifest_op, row), partition_key=row["upload_id"])
 
 
 @schedule(

@@ -56,6 +56,12 @@ class Settings:
 
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
 
+    # Saga（docs/saga-consistency-guide.md）：RUNNING 状态多久没有心跳（advance）
+    # 就允许被新的 run 接管 / 被 stuck sensor 重新入队
+    saga_takeover_minutes: int = field(default_factory=lambda: int(_env("SAGA_TAKEOVER_MINUTES", "30")))
+    # stuck 自动重试上限：超过后不再自动入队，转为 failed + alert 等人工介入
+    saga_max_attempts: int = field(default_factory=lambda: int(_env("SAGA_MAX_ATTEMPTS", "3")))
+
     @property
     def platform_dsn(self) -> str:
         return (

@@ -27,7 +27,12 @@ from orchestration.schedules import (
     ingest_append_fallback_schedule,
     ingest_correct_fallback_schedule,
 )
-from orchestration.sensors import annotation_collect_sensor, ingest_append_sensor, ingest_correct_sensor
+from orchestration.sensors import (
+    annotation_collect_sensor,
+    ingest_append_sensor,
+    ingest_correct_sensor,
+    ingest_stuck_sensor,
+)
 
 defs = Definitions(
     assets=[
@@ -53,5 +58,5 @@ defs = Definitions(
         compaction_job,
     ],
     schedules=[ingest_append_fallback_schedule, ingest_correct_fallback_schedule, compaction_schedule],
-    sensors=[ingest_append_sensor, ingest_correct_sensor, annotation_collect_sensor],
+    sensors=[ingest_append_sensor, ingest_correct_sensor, ingest_stuck_sensor, annotation_collect_sensor],
 )

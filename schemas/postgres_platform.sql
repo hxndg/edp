@@ -58,6 +58,25 @@ CREATE TABLE IF NOT EXISTS dataset_request (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Saga 执行日志（docs/saga-consistency-guide.md）：跨多次 Iceberg commit 的引擎流程
+-- （ingest_append / ingest_correct）的"事务外壳"。一个 (scope, business_id) 同一时刻
+-- 只允许一个 RUNNING 的 owner（run_id 即 fencing token），并发触发靠 claim 的 CAS 挡掉。
+-- 注意：common/saga.py 启动时也会 CREATE TABLE IF NOT EXISTS 一份同样的 DDL，
+-- 保证老部署（postgres 卷已初始化过、不会重跑本脚本）也能拿到这张表。
+CREATE TABLE IF NOT EXISTS saga_log (
+    scope               TEXT NOT NULL,          -- 业务流程名：ingest_append / ingest_correct
+    business_id         TEXT NOT NULL,          -- 业务主键：upload_id
+    run_id              TEXT NOT NULL,          -- 当前 owner 的 Dagster run_id（fencing token）
+    status              TEXT NOT NULL DEFAULT 'RUNNING'
+                        CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED')),
+    step                TEXT NOT NULL DEFAULT 'CLAIM',  -- 最近推进到的步骤，advance() 时更新（兼作心跳）
+    attempt             INT  NOT NULL DEFAULT 1,        -- 第几次尝试，claim 接管时 +1，用于限制自动重试
+    error               TEXT,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (scope, business_id)
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id            BIGSERIAL PRIMARY KEY,
     severity            TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),

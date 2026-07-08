@@ -122,8 +122,13 @@ def run(
 
     from common.iceberg import append
 
-    append(DATASET, dataset_row)
+    # 写入顺序有讲究（docs/saga-consistency-guide.md）：先写明细 dataset_sample，
+    # 最后写"头行" dataset（state=RELEASED 相当于本次冻结的 COMMIT 标记）。
+    # 读者按"先查到 dataset 头行才去读明细"的协议消费，中途崩溃只会留下
+    # 没有头行的孤儿明细（无害，重跑会生成新 version），不会出现
+    # "头行已 RELEASED、明细缺失"的脏数据。
     append(DATASET_SAMPLE, dataset_sample_rows)
+    append(DATASET, dataset_row)
 
     return {
         "dataset_name": dataset_name,

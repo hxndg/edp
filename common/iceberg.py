@@ -160,37 +160,31 @@ def append(table_name: str, arrow_table: pa.Table) -> Table:
 def upsert(table_name: str, arrow_table: pa.Table, join_cols: list[str]) -> Table:
     """行级 MERGE 语义：命中 join_cols 的行覆盖，其余追加。
 
-    项目锁定的 pyiceberg==0.7.1 还没有内置 `Table.upsert`（这个 API 是后续版本
-    才加的），所以这里手写等价实现：先删除表里 join_cols 命中这批新数据的旧行，
-    再整批 append 新数据，delete+append 在同一个 pyiceberg transaction 语义下
-    效果等价于 MERGE（参见 README 4.6"行级重写"）。如果之后升级 pyiceberg 到
-    原生支持 upsert 的版本，优先走原生实现（未来大表场景性能更好）。
+    使用 pyiceberg >= 0.9 的原生 `Table.upsert`：内部在**单个 Iceberg 事务**里
+    完成 matched-update + not-matched-insert，只产生一次 commit，读者要么看到
+    整批新数据、要么看到整批旧数据，不存在"删了旧行、还没插新行"的中间态
+    （旧版手写 delete+append 是两次 commit，存在这个窗口，已废弃）。
     """
     tbl = load_table(table_name)
     aligned = _align_to_table_schema(arrow_table, tbl)
-    if hasattr(tbl, "upsert"):  # pragma: no cover - 面向未来 pyiceberg 版本的快路径
-        tbl.upsert(aligned, join_cols=join_cols)
-    else:
-        _delete_matching_rows(tbl, aligned, join_cols)
-        tbl.append(aligned)
+    tbl.upsert(aligned, join_cols=join_cols)
     return tbl
 
 
-def _delete_matching_rows(tbl: Table, aligned: pa.Table, join_cols: list[str]) -> None:
-    """删除表中 join_cols 组合命中本批新数据的旧行，为后续 append 腾位置。"""
-    from functools import reduce
+def replace_where(table_name: str, delete_filter, arrow_table: pa.Table | None) -> Table:
+    """事务式"范围覆盖"：删除命中 delete_filter 的旧行 + 追加整批新行，单次 commit。
 
-    from pyiceberg.expressions import And, EqualTo, Or
+    用 pyiceberg 的 `Table.transaction()` 把 delete 和 append 合并成一个原子
+    快照提交，专门服务两类场景（见 docs/saga-consistency-guide.md）：
+    - ingest_append 重跑：先清掉上一次半途而废的 bronze/silver 行再写，幂等；
+    - ingest_correct 范围修正：delete 受影响时间窗 + append 修正数据必须原子，
+      否则并发读者会看到"旧数据没了、新数据还没来"的空洞。
 
-    seen: set[tuple] = set()
-    conditions = []
-    for row in aligned.select(join_cols).to_pylist():
-        key = tuple(row[c] for c in join_cols)
-        if key in seen or any(v is None for v in key):
-            continue
-        seen.add(key)
-        conditions.append(reduce(And, (EqualTo(c, v) for c, v in zip(join_cols, key))))
-    if not conditions:
-        return
-    delete_filter = reduce(Or, conditions)
-    tbl.delete(delete_filter=delete_filter)
+    arrow_table 传 None / 空表时退化为纯删除（同样是一次 commit）。
+    """
+    tbl = load_table(table_name)
+    with tbl.transaction() as txn:
+        txn.delete(delete_filter=delete_filter)
+        if arrow_table is not None and arrow_table.num_rows > 0:
+            txn.append(_align_to_table_schema(arrow_table, tbl))
+    return tbl
