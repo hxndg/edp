@@ -1,0 +1,213 @@
+# 基础设施：Postgres / Kafka / MinIO(+建桶 Job) / Iceberg REST Catalog。
+# 与 docker-compose.yml 同一套镜像和参数，只是搬进集群。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: POSTGRES_USER, value: edp }
+            - { name: POSTGRES_PASSWORD, value: edp123 }
+            # 主库建 dagster，init 脚本再建 platform 库并灌 DDL（与 docker-compose 相同）
+            - { name: POSTGRES_DB, value: dagster }
+            - { name: POSTGRES_PLATFORM_DB, value: platform }
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            # postgres-init configmap 由 apply.sh 从 schemas/ 目录生成，避免 SQL 双份维护
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "edp", "-d", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: edp-postgres
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# 单节点 KRaft Kafka（与 docker-compose 相同镜像），只暴露集群内 listener kafka:9092。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: data
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: kafka }
+  template:
+    metadata:
+      labels: { app: kafka }
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: KAFKA_NODE_ID, value: "1" }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_LISTENERS, value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093" }
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "PLAINTEXT://kafka:9092" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@localhost:9093" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: CLUSTER_ID, value: "edp-mvp-kraft-cluster-id" }
+          ports:
+            - containerPort: 9092
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: data
+spec:
+  selector: { app: kafka }
+  ports:
+    - port: 9092
+      targetPort: 9092
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: data
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: minioadmin }
+            - { name: MINIO_ROOT_PASSWORD, value: minioadmin123 }
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: edp-minio
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: data
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: api, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# 建 bucket 的一次性 Job（等价 compose 的 minio-init）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: data
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until mc alias set local http://minio:9000 minioadmin minioadmin123; do sleep 2; done
+              mc mb -p local/lake
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iceberg-rest
+  namespace: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: iceberg-rest }
+  template:
+    metadata:
+      labels: { app: iceberg-rest }
+    spec:
+      containers:
+        - name: iceberg-rest
+          image: tabulario/iceberg-rest:1.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: CATALOG_WAREHOUSE, value: "s3://lake/warehouse" }
+            - { name: CATALOG_IO__IMPL, value: "org.apache.iceberg.aws.s3.S3FileIO" }
+            - { name: CATALOG_S3_ENDPOINT, value: "http://minio:9000" }
+            - { name: CATALOG_S3_PATH__STYLE__ACCESS, value: "true" }
+            - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
+            - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin123 }
+            - { name: AWS_REGION, value: us-east-1 }
+          ports:
+            - containerPort: 8181
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-rest
+  namespace: data
+spec:
+  selector: { app: iceberg-rest }
+  ports:
+    - port: 8181
+      targetPort: 8181

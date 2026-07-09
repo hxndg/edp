@@ -1,0 +1,50 @@
+# Dagster 实例配置（挂载为 configmap `dagster-instance`，webserver / daemon /
+# code-location / 每个 run pod 都读同一份）。
+storage:
+  postgres:
+    postgres_db:
+      username: edp
+      password: edp123
+      hostname: postgres
+      db_name: dagster
+      port: 5432
+
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 4
+
+# 方案 A 的执行面：每个 run 一个 K8s Job pod，镜像来自 code-location 的
+# DAGSTER_CURRENT_IMAGE（同一个 edp:dev），环境变量注入 edp-env configmap。
+run_launcher:
+  module: dagster_k8s
+  class: K8sRunLauncher
+  config:
+    service_account_name: dagster
+    job_namespace: data
+    instance_config_map: dagster-instance
+    env_config_maps:
+      - edp-env
+    image_pull_policy: IfNotPresent
+    load_incluster_config: true
+    volumes:
+      - name: lance
+        persistentVolumeClaim:
+          claimName: edp-lance
+    volume_mounts:
+      - name: lance
+        mountPath: /data/lance
+
+# tick 历史保留（run 本身的 30 天清理见 orchestration/schedules.py 的维护 job 讨论）
+retention:
+  schedule:
+    purge_after_days: 30
+  sensor:
+    purge_after_days:
+      skipped: 7
+      failure: 30
+      success: 30
+
+telemetry:
+  enabled: false

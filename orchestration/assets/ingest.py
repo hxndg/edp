@@ -24,9 +24,9 @@ from orchestration.partitions import upload_sessions_partitions_def
     partitions_def=upload_sessions_partitions_def,
     group_name="ingest",
     outs={
-        "raw_file": AssetOut(description="原始文件登记（README 3.1.2）"),
-        "episode": AssetOut(description="一次连续采集的语义单元（README 3.1.2）"),
-        "sample": AssetOut(description="切出的训练/评测样本，本体在 Lance（README 3.1.2）"),
+        "raw_file": AssetOut(description="原始文件登记（README 3.1.1.2）"),
+        "episode": AssetOut(description="一次连续采集的语义单元（README 3.1.1.2）"),
+        "sample": AssetOut(description="切出的训练/评测样本，本体在 Lance（README 3.1.1.2）"),
     },
 )
 def ingest_multi_asset(context: AssetExecutionContext):

@@ -1,0 +1,6 @@
+# webserver / daemon 通过 gRPC 连 code-location（用户代码独立部署、独立升级）
+load_from:
+  - grpc_server:
+      host: dagster-code
+      port: 4000
+      location_name: edp

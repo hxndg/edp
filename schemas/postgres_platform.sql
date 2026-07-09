@@ -1,4 +1,4 @@
--- platform 库 DDL —— 业务瞬态状态（README 3.1.6 / 3.1.7）
+-- platform 库 DDL —— 业务瞬态状态（README 3.1.2）
 -- 这些表只做"当前状态点查"，理论上可从 Iceberg 快照 + Kafka 事件重放重建，不是数据 SoT。
 -- 由 docker-compose 的 postgres 初始化脚本在容器首次启动时自动执行一次。
 
@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 策略注册表（README 3.1.7）：每个处理阶段实际执行哪个策略由这张表在运行时解析。
+-- 策略注册表（README 3.1.2.2）：每个处理阶段实际执行哪个策略由这张表在运行时解析。
 CREATE TABLE IF NOT EXISTS pipeline_step_config (
     stage               TEXT NOT NULL,
     strategy_id         TEXT NOT NULL,
@@ -105,6 +105,6 @@ INSERT INTO pipeline_step_config (stage, strategy_id, entrypoint, owner, is_defa
     ('entity_tag',   'default', 'engines.duckdb.entity_tag:rules_default', 'platform-eng', TRUE, '默认规则打标签：按质量分/时长分档'),
     ('entity_tag',   'strict',  'engines.duckdb.entity_tag:rules_strict', 'research-team-a', FALSE, '备用规则：更严格的质量分阈值，供科研团队 A 试验'),
     ('annotation_promote', 'default', 'engines.ray.annotation_auto:promote_default', 'platform-eng', TRUE, 'auto_only 分支下预标转正阈值策略'),
-    ('qc',           'default', 'engines.ray.qc:qc_default', 'platform-eng', TRUE, '默认质检：随机抽检 + 规则阈值 mock'),
+    ('qc',           'default', 'engines.ray.qc:qc_default', 'platform-eng', TRUE, '默认数据质检：滑动窗口内 imu/pose 频率 >= 8Hz + 位姿相邻位移 <= 0.5m'),
     ('export',       'default', 'engines.spark.export_dataset:export_default', 'platform-eng', TRUE, '默认导出：单一 shard 格式')
 ON CONFLICT (stage, strategy_id) DO NOTHING;

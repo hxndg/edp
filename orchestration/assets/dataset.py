@@ -61,7 +61,7 @@ class ExportDatasetConfig(Config):
     group_name="dataset",
     ins={"dataset": AssetIn()},
     name="dataset_export",
-    description="把 Dataset 清单物化成训练格式 shard（README 2.4 / 3.1.7：⚙ 策略注册表 stage=export）",
+    description="把 Dataset 清单物化成训练格式 shard（README 2.4 / 3.1.2.2：⚙ 策略注册表 stage=export）",
 )
 def dataset_export_asset(context: AssetExecutionContext, config: ExportDatasetConfig, dataset: str) -> Output[dict]:
     from engines.spark.export_dataset import run as export_run

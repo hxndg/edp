@@ -1,4 +1,4 @@
-"""规则打标签（README 3.1.7 stage=`entity_tag`）：小批量、秒起秒停，DuckDB 执行。
+"""规则打标签（README 3.1.2.2 stage=`entity_tag`）：小批量、秒起秒停，DuckDB 执行。
 
 `rules_default` / `rules_strict` 是策略注册表里登记的两个策略，函数签名统一：
 `(samples: pandas.DataFrame) -> list[dict]`，返回值是待写入 `entity_tag` 的行。
@@ -40,7 +40,7 @@ def rules_default(samples: pd.DataFrame) -> list[dict]:
 
 
 def rules_strict(samples: pd.DataFrame) -> list[dict]:
-    """备用策略：阈值更严格，供某科研团队按自己的质量口径试验（README 3.1.7 示例）。"""
+    """备用策略：阈值更严格，供某科研团队按自己的质量口径试验（README 3.1.2.2 示例）。"""
     now = datetime.now(timezone.utc)
     return [
         {

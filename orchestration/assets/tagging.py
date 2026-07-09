@@ -1,4 +1,4 @@
-"""Tag 自由组织（README 3.1.4 / 3.2.5）：DuckDB 规则打标签，行为性替换的
+"""Tag 自由组织（README 3.1.1.4 / 3.2.5）：DuckDB 规则打标签，行为性替换的
 典型例子——具体规则由策略注册表 `entity_tag` stage 解析（README 4.3）。
 """
 

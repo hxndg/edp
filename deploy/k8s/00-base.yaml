@@ -1,0 +1,109 @@
+# 基础对象：namespace / 共享环境变量 / PVC / Dagster RBAC。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data
+---
+# 所有 EDP 组件（gateway / dagster 三件套 / run pod）共用的环境变量。
+# K8sRunLauncher 通过 env_config_maps 把它注入每个 run pod，保证
+# "编排进程看到的配置 == 引擎 pod 看到的配置"。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edp-env
+  namespace: data
+data:
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: edp
+  POSTGRES_PASSWORD: edp123
+  POSTGRES_DAGSTER_DB: dagster
+  POSTGRES_PLATFORM_DB: platform
+  KAFKA_BOOTSTRAP: kafka:9092
+  KAFKA_TOPIC: edp.events
+  KAFKA_INGEST_TOPIC: edp.ingest.requests
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin123
+  MINIO_BUCKET: lake
+  ICEBERG_REST_URI: http://iceberg-rest:8181
+  ICEBERG_WAREHOUSE: s3://lake/warehouse
+  ICEBERG_CATALOG_NAME: edp
+  LANCE_ROOT: /data/lance
+  DAGSTER_HOST: dagster-webserver
+  DAGSTER_PORT: "3000"
+  GATEWAY_HOST: 0.0.0.0
+  GATEWAY_PORT: "8000"
+  LOG_LEVEL: INFO
+  SAGA_TAKEOVER_MINUTES: "30"
+  SAGA_MAX_ATTEMPTS: "3"
+---
+# minikube 单节点：hostpath 动态供给的 RWO PVC 可以被同节点多个 pod 同时挂载。
+# lance PVC 挂进 code-location 和所有 run pod（K8sRunLauncher volumes 配置），
+# 保证 sample 表里的 lance_uri 在任何 pod 里都指向同一份文件。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edp-lance
+  namespace: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edp-postgres
+  namespace: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edp-minio
+  namespace: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+# K8sRunLauncher 需要在 data 命名空间里建/查/删 Job 和 Pod
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dagster
+  namespace: data
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dagster
+  namespace: data
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dagster
+  namespace: data
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dagster
+subjects:
+  - kind: ServiceAccount
+    name: dagster
+    namespace: data

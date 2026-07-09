@@ -1,7 +1,7 @@
 """`export_dataset` 的核心逻辑（README 3.2.3）：把冻结的 Dataset 清单物化成
 可被 dataloader 消费的 shard（MVP 只做一种格式：JSONL，一行一个 sample）。
 
-`export_default` 是策略注册表 `export` stage 的默认策略（README 3.1.7），
+`export_default` 是策略注册表 `export` stage 的默认策略（README 3.1.2.2），
 入口签名统一为 `(dataset_name, dataset_version) -> dict`，方便未来新增
 `tfrecord`/`webdataset` 等格式时只加一行配置，不改 Dagster 资产图。
 """

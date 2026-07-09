@@ -29,7 +29,7 @@ def _producer() -> KafkaProducer:
     )
 
 
-def emit(event_type: str, key: str, payload: dict[str, Any]) -> None:
+def emit(event_type: str, key: str, payload: dict[str, Any], *, topic: str | None = None) -> None:
     """写一条事实事件到账本。event_type 例如 upload.created / manifest.submitted。"""
     record = {
         "event_type": event_type,
@@ -37,7 +37,21 @@ def emit(event_type: str, key: str, payload: dict[str, Any]) -> None:
         "payload": payload,
     }
     try:
-        _producer().send(settings.kafka_topic, key=key, value=record)
+        _producer().send(topic or settings.kafka_topic, key=key, value=record)
         _producer().flush(timeout=5)
     except Exception:  # noqa: BLE001 - 账本是派生态，写失败不应该打断主流程
         logger.exception("kafka ledger emit failed: event_type=%s key=%s", event_type, key)
+
+
+def emit_ingest_request(upload_id: str, manifest_op: str) -> None:
+    """发一条 ingest 触发事件到专用 topic，由 `ingest_kafka_sensor` 消费拉起 run。
+
+    与账本 emit 一样"尽力而为"：发失败不打断主流程——upload_session 已经是
+    ready 状态，T+1 兜底 schedule（轮询 PG）会补触发，不会丢。
+    """
+    emit(
+        "ingest.requested",
+        key=upload_id,
+        payload={"upload_id": upload_id, "manifest_op": manifest_op},
+        topic=settings.kafka_ingest_topic,
+    )

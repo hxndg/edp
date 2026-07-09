@@ -1,0 +1,11 @@
+.git
+.venv
+data/
+.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+.env
+docs/
+deploy/
+tools/datagen/fixtures/

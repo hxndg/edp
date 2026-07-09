@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # docker-entrypoint-initdb.d 钩子：postgres 容器首次启动、`dagster` 主库建好后，
-# 额外创建 `platform` 库并灌入 platform 的 DDL（README 3.1.6/3.1.7）。
+# 额外创建 `platform` 库并灌入 platform 的 DDL（README 3.1.2）。
 # Dagster 自身的元数据表由 dagster-postgres 在应用层自动建表，这里不需要手动建。
 set -euo pipefail
 

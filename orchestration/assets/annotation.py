@@ -101,7 +101,7 @@ def annotation_collect(context: AssetExecutionContext) -> Output[dict]:
 @asset(
     group_name="annotation",
     deps=[AssetKey("annotation_auto"), AssetKey("annotation_collect")],
-    description="自动质检（README 2.4：Ray mock），从 Iceberg 里增量找待质检的 annotation",
+    description="自动数据质检（README 3.4：滑动窗口频率 + 位姿连续性），增量找已转正 annotation 对应的 sample",
 )
 def qc_result(context: AssetExecutionContext) -> Output[dict]:
     from engines.ray.qc import run as qc_run

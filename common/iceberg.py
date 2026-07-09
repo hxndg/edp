@@ -21,7 +21,7 @@ from common.config import settings
 
 NAMESPACE = "edp"
 
-# 每张表都加的四列审计列（README 3.1.8），建表 schema 里统一拼进去，
+# 每张表都加的四列审计列（README 3.1.3），建表 schema 里统一拼进去，
 # 避免每个表定义各写一遍、漏掉某一列。
 AUDIT_FIELDS_DDL = """
     _batch_id STRING,

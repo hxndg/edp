@@ -33,6 +33,7 @@ dependencies = [
     "click>=8.1",
     "requests>=2.32",
     "python-dotenv>=1.0",
+    "dagster-k8s>=0.24,<0.25",
 ]
 
 [dependency-groups]

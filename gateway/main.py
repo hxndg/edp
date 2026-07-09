@@ -18,7 +18,7 @@ from common import object_store
 from common.config import settings
 from common.dagster_client import launch_job
 from common.db import execute, fetch_one, to_json
-from common.kafka_ledger import emit
+from common.kafka_ledger import emit, emit_ingest_request
 from gateway.models import (
     AnnotationCompleteWebhook,
     CreateSessionRequest,
@@ -125,8 +125,11 @@ def submit_manifest(upload_id: str, req: ManifestSubmitRequest) -> dict:
         f"{object_store.PREFIX_RAW}/{session['robot_id']}/{upload_id}/manifest.json",
         to_json(manifest_payload).encode("utf-8"),
     )
-    # 只记账，不触发——真正拉起 ingest_append/ingest_correct 的是 Dagster 自己的 sensor（README 2.2 原则 5）
     emit("manifest.submitted", key=upload_id, payload=manifest_payload)
+    # 触发事件：ingest_kafka_sensor 消费这条消息拉起对应 job。发失败也没关系——
+    # session 已是 ready，T+1 兜底 schedule 轮询 PG 会补触发；重复发也没关系——
+    # sensor 端会校验 status=ready + run_key 去重 + saga claim 三层兜底。
+    emit_ingest_request(upload_id, session["manifest_op"])
     return {"upload_id": upload_id, "status": "ready", "manifest_op": session["manifest_op"]}
 
 

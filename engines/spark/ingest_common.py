@@ -2,7 +2,7 @@
 
 被 `ingest_append.py` / `ingest_correct.py` 共用。`clean_default` /
 `clean_strict` 是策略注册表 `silver_clean` stage 下可替换的行为性策略
-（README 3.1.7 / 4.3），签名统一为 `(bronze_rows: list[dict]) -> list[dict]`。
+（README 3.1.2.2 / 4.3），签名统一为 `(bronze_rows: list[dict]) -> list[dict]`。
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import pyarrow as pa
 from common.config import settings
 
 IMU_TOPIC = "imu"
+POSE_TOPIC = "pose"
 SLICER_VERSION = "v1-fixed-window"
 WINDOW_SECONDS = 2.0
 
@@ -31,23 +32,34 @@ def ns_to_datetime(ns: int) -> datetime:
     return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
 
 
-def read_imu_messages(file_bytes: bytes) -> list[dict]:
-    """读一个 MCAP 文件的 imu topic，返回 bronze 行（不做清洗）。"""
+def read_topic_messages(file_bytes: bytes, topics: list[str]) -> dict[str, list[dict]]:
+    """按 topic 读一个 MCAP 文件，返回 {topic: [{ts, seq, payload}, ...]}（按 ts 升序）。
+
+    入湖只消费 imu（bronze/silver 分层表是 imu 专属的），数据质检
+    （engines/ray/qc.py）额外消费 pose 做位姿连续性检查。
+    """
     from mcap.reader import make_reader
 
-    rows: list[dict] = []
+    result: dict[str, list[dict]] = {t: [] for t in topics}
     with io.BytesIO(file_bytes) as f:
         reader = make_reader(f)
-        for _schema, channel, message in reader.iter_messages(topics=[IMU_TOPIC]):
+        for _schema, channel, message in reader.iter_messages(topics=topics):
             payload = json.loads(message.data.decode("utf-8"))
-            rows.append(
+            result[channel.topic].append(
                 {
                     "ts": ns_to_datetime(message.log_time),
                     "seq": message.sequence,
                     "payload": payload,
                 }
             )
-    return rows
+    for rows in result.values():
+        rows.sort(key=lambda r: r["ts"])
+    return result
+
+
+def read_imu_messages(file_bytes: bytes) -> list[dict]:
+    """读一个 MCAP 文件的 imu topic，返回 bronze 行（不做清洗）。"""
+    return read_topic_messages(file_bytes, [IMU_TOPIC])[IMU_TOPIC]
 
 
 def clean_default(bronze_rows: list[dict]) -> list[dict]:

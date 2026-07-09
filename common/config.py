@@ -42,6 +42,9 @@ class Settings:
     # Kafka
     kafka_bootstrap: str = field(default_factory=lambda: _env("KAFKA_BOOTSTRAP", "localhost:9094"))
     kafka_topic: str = field(default_factory=lambda: _env("KAFKA_TOPIC", "edp.events"))
+    # ingest 触发专用 topic（区别于 kafka_topic 账本）：gateway 提交 manifest 后
+    # 发一条 ingest.requested，Dagster 的 kafka sensor 消费它拉起 run
+    kafka_ingest_topic: str = field(default_factory=lambda: _env("KAFKA_INGEST_TOPIC", "edp.ingest.requests"))
 
     # Iceberg REST catalog
     iceberg_rest_uri: str = field(default_factory=lambda: _env("ICEBERG_REST_URI", "http://localhost:8181"))
