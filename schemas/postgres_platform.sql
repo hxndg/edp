@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 运行时配置（README 3.6.2）：微批/背压/保留策略参数。UPDATE 后 sensor 下个 tick
+-- 生效，不用重启任何组件。common/runtime_config.py 启动时也会幂等地建表 + 播种默认值。
+CREATE TABLE IF NOT EXISTS runtime_config (
+    key                 TEXT PRIMARY KEY,
+    value               TEXT NOT NULL,
+    description         TEXT,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO runtime_config (key, value, description) VALUES
+    ('INGEST_BATCH_MAX', '200', '单个微批最多合并多少条 ingest.requested 消息（README 3.6.2）'),
+    ('INGEST_MAX_INFLIGHT_BATCHES', '3', '同时在跑（排队+执行中）的 ingest 批次上限，达到即暂停消费 Kafka'),
+    ('RETENTION_DAYS', '30', 'Dagster run 记录与 PG 终态行的保留天数（README 3.6.4）'),
+    ('INGEST_WORKER_TIMEOUT_SECONDS', '600', '单个解析 worker pod 的硬超时（README 3.6.3，activeDeadlineSeconds）'),
+    ('INGEST_WORKER_MAX_PARALLEL', '20', '同时在跑的解析 worker pod 数上限（README 3.6.3，分波调度）'),
+    ('STAGING_RETENTION_DAYS', '7', 'MinIO staging/ 交接区残留文件的保留天数（README 3.6.3，retention job 按 mtime 清）')
+ON CONFLICT (key) DO NOTHING;
+
 -- 策略注册表（README 3.1.2.2）：每个处理阶段实际执行哪个策略由这张表在运行时解析。
 CREATE TABLE IF NOT EXISTS pipeline_step_config (
     stage               TEXT NOT NULL,

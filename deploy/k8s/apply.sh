@@ -30,13 +30,15 @@ kubectl -n "$NS" create configmap dagster-workspace \
   --from-file=workspace.yaml=deploy/k8s/workspace.yaml \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# 10-infra：postgres / kafka / minio / iceberg-rest；20-apps：dagster 三件套 + gateway
+# 10-infra：postgres / kafka / minio / iceberg-rest / opensearch(+dashboards)；
+# 20-apps：dagster 三件套 + gateway
 kubectl apply -f deploy/k8s/10-infra.yaml -f deploy/k8s/20-apps.yaml
 
 echo
 echo "等待就绪：kubectl -n $NS get pods -w"
 echo "Dagster UI：kubectl -n $NS port-forward svc/dagster-webserver 3000:3000"
 echo "Gateway   ：kubectl -n $NS port-forward svc/gateway 8000:8000"
+echo "Tag 检索界面（OpenSearch Dashboards）：kubectl -n $NS port-forward svc/opensearch-dashboards 5601:5601"
 echo "首次部署记得建 Iceberg 表："
 echo "  kubectl -n $NS run init-iceberg --rm -it --restart=Never --image=edp:dev \\"
 echo "    --overrides='{\"spec\":{\"containers\":[{\"name\":\"init-iceberg\",\"image\":\"edp:dev\",\"command\":[\"python\",\"-m\",\"schemas.iceberg_tables\"],\"envFrom\":[{\"configMapRef\":{\"name\":\"edp-env\"}}]}]}}'"

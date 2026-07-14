@@ -15,3 +15,15 @@ def entity_tag(context: AssetExecutionContext) -> Output[dict]:
 
     result = entity_tag_run(run_id=context.run_id)
     return Output(value=result, metadata=result)
+
+
+@asset(
+    group_name="tagging",
+    deps=[AssetKey("entity_tag")],
+    description="OpenSearch tag 检索投影（README 3.5：SoT 在 Iceberg，全量重建式同步）",
+)
+def entity_tag_index(context: AssetExecutionContext) -> Output[dict]:
+    from engines.search.tag_index import run as tag_index_run
+
+    result = tag_index_run(run_id=context.run_id)
+    return Output(value=result, metadata=result)

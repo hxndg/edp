@@ -173,6 +173,102 @@ spec:
               until mc alias set local http://minio:9000 minioadmin minioadmin123; do sleep 2; done
               mc mb -p local/lake
 ---
+# OpenSearch：tag 检索投影（README 3.5）。SoT 在 Iceberg，索引可整体重建，
+# 所以单节点、无副本、emptyDir 存储都可接受——挂了重跑 entity_tag_index 即可。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch
+  namespace: data
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: opensearch }
+  template:
+    metadata:
+      labels: { app: opensearch }
+    spec:
+      initContainers:
+        # OpenSearch 启动要求 vm.max_map_count >= 262144（minikube 节点默认不够）
+        - name: sysctl
+          image: busybox:1.36
+          command: ["sysctl", "-w", "vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2.19.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: discovery.type, value: single-node }
+            - { name: DISABLE_SECURITY_PLUGIN, value: "true" }  # MVP：集群内明文访问
+            - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
+          ports:
+            - containerPort: 9200
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/opensearch/data
+          readinessProbe:
+            httpGet: { path: /_cluster/health, port: 9200 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch
+  namespace: data
+spec:
+  selector: { app: opensearch }
+  ports:
+    - port: 9200
+      targetPort: 9200
+---
+# OpenSearch Dashboards：人用的检索界面（Discover + DQL 复合查询），
+# 程序检索走 gateway /search/tags，两者读同一个索引。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch-dashboards
+  namespace: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: opensearch-dashboards }
+  template:
+    metadata:
+      labels: { app: opensearch-dashboards }
+    spec:
+      containers:
+        - name: dashboards
+          image: opensearchproject/opensearch-dashboards:2.19.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: OPENSEARCH_HOSTS, value: '["http://opensearch:9200"]' }
+            - { name: DISABLE_SECURITY_DASHBOARDS_PLUGIN, value: "true" }
+          ports:
+            - containerPort: 5601
+          readinessProbe:
+            httpGet: { path: /api/status, port: 5601 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch-dashboards
+  namespace: data
+spec:
+  selector: { app: opensearch-dashboards }
+  ports:
+    - port: 5601
+      targetPort: 5601
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

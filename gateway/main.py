@@ -29,6 +29,8 @@ from gateway.models import (
     PresignRequest,
     PresignResponse,
     SessionStatusResponse,
+    TagSearchRequest,
+    TagSearchResponse,
 )
 
 logging.basicConfig(level=settings.log_level)
@@ -177,6 +179,21 @@ def create_dataset_request(req: DatasetRequestIn) -> DatasetRequestOut:
     )
     emit("dataset_request.created", key=request_id, payload=req.model_dump())
     return DatasetRequestOut(request_id=request_id, status="building", dagster_run_id=run_id)
+
+
+# ---------------------------------------------------------------------------
+# tag 检索（README 3.5：查 OpenSearch 投影，不碰 Iceberg/PG）
+# ---------------------------------------------------------------------------
+
+@app.post("/search/tags", response_model=TagSearchResponse)
+def search_tags(req: TagSearchRequest) -> TagSearchResponse:
+    from common.search import search_by_tags
+
+    try:
+        result = search_by_tags(req.tags, target_type=req.target_type, size=req.size)
+    except Exception as exc:  # 投影不可用不应该被误读成"没有数据"
+        raise HTTPException(status_code=503, detail=f"OpenSearch 查询失败：{exc}") from exc
+    return TagSearchResponse(**result)
 
 
 # ---------------------------------------------------------------------------

@@ -1,27 +1,32 @@
-"""上传入湖（README 3.2.1）。
+"""上传入湖（README 3.2.1 / 3.6）。
 
-`raw_file`/`episode`/`sample` 是同一个 `@multi_asset`：一次 Spark 作业原子地
+`raw_file`/`episode`/`sample` 是同一个 `@multi_asset`：一次批量入湖作业原子地
 把三张表一起写掉，在 Dagster 图上仍然是三个独立可点击、可查血缘的节点。
+
+微批形态（README 3.6.2）："这次处理哪些 upload"不再走动态分区，而是由
+sensor/schedule 在 RunRequest 的 `run_config` 里传 `upload_ids` 列表——
+run 的数量由批次窗口决定，与上传量解耦，Dagster 的分区集合/事件日志不再
+随 upload 数线性增长。
 
 `manifest_op=append` 和 `manifest_op=correct` 的区分**不是**这个函数体里的
 if/else 分支——README 2.2 原则 9 明确说这属于"结构性分支"，必须在图上可见。
-这里的做法是：两个不同的 sensor（见 `orchestration/sensors.py`）各自拉起
-`ingest_append_job` / `ingest_correct_job` 两个不同名字的 job，运行历史上
-一眼就能分辨是哪一条链路；函数体内部只是根据 `upload_session.manifest_op`
-（触发前就已经确定、不是本函数决定）选用对应的执行引擎模块，本质上等价于
-"两个不同的 job 各自调用两个不同的函数"，只是共享同一组 asset 身份以对齐
-Iceberg 里同一批表。
+两个不同的 sensor 触发路径各自拉起 `ingest_append_job` / `ingest_correct_job`
+两个不同名字的 job（一个批次只含同一种 op，见 3.6.2），函数体内部只是根据
+config 里的 manifest_op 选用对应的执行引擎模块。
 """
 
-from dagster import AssetExecutionContext, Output, multi_asset, AssetOut
+from dagster import AssetExecutionContext, AssetOut, Config, MetadataValue, Output, multi_asset
 
-from common.db import fetch_one
-from orchestration.partitions import upload_sessions_partitions_def
+
+class IngestBatchConfig(Config):
+    """一个微批的内容：sensor 按 (tick, manifest_op) 分组后填进 RunRequest。"""
+
+    upload_ids: list[str]
+    manifest_op: str  # append | correct
 
 
 @multi_asset(
     name="ingest_multi_asset",
-    partitions_def=upload_sessions_partitions_def,
     group_name="ingest",
     outs={
         "raw_file": AssetOut(description="原始文件登记（README 3.1.1.2）"),
@@ -29,49 +34,46 @@ from orchestration.partitions import upload_sessions_partitions_def
         "sample": AssetOut(description="切出的训练/评测样本，本体在 Lance（README 3.1.1.2）"),
     },
 )
-def ingest_multi_asset(context: AssetExecutionContext):
-    upload_id = context.partition_key
-    run_id = context.run_id
-    session = fetch_one("SELECT manifest_op FROM upload_session WHERE upload_id = %s", (upload_id,))
-    if session is None:
-        raise ValueError(f"upload_session '{upload_id}' 不存在（sensor 传了一个野分区键？）")
-
-    if session["manifest_op"] == "append":
-        from engines.spark.ingest_append import run as ingest_run
-
-        result = ingest_run(upload_id, run_id)
+def ingest_multi_asset(context: AssetExecutionContext, config: IngestBatchConfig):
+    if config.manifest_op == "append":
+        from engines.spark.ingest_append import run_batch
     else:
-        from engines.spark.ingest_correct import run as ingest_run
+        from engines.spark.ingest_correct import run_batch
 
-        result = ingest_run(upload_id, run_id)
+    result = run_batch(config.upload_ids, context.run_id)
+    per_upload = result["per_upload"]
 
-    episode_id = result["episode_id"]
-    sample_ids = _list_new_sample_ids(episode_id)
+    batch_meta = {
+        "manifest_op": config.manifest_op,
+        "num_requested": result["num_requested"],
+        "num_claimed": result["num_claimed"],
+        "num_succeeded": result["num_succeeded"],
+        "num_failed": result["num_failed"],
+        "silver_clean_strategy_id": result["silver_clean_strategy_id"],
+    }
+    if result["failures"]:
+        batch_meta["failures"] = MetadataValue.json(result["failures"])
+    if result["skipped_uploads"]:
+        batch_meta["skipped_uploads"] = MetadataValue.json(result["skipped_uploads"])
 
     yield Output(
-        value={"upload_id": upload_id, **_safe(result, ["num_files", "quarantined_files"])},
+        value={"upload_ids": [p["upload_id"] for p in per_upload]},
         output_name="raw_file",
-        metadata={"manifest_op": session["manifest_op"], **_safe(result, ["num_files", "quarantined_files"])},
+        metadata={
+            **batch_meta,
+            "num_files": sum(p["num_files"] for p in per_upload),
+            "quarantined_files": result["quarantined_files"],
+        },
     )
     yield Output(
-        value=episode_id,
+        value=[p["episode_id"] for p in per_upload],
         output_name="episode",
-        metadata={"episode_id": episode_id, "manifest_op": session["manifest_op"]},
+        metadata={**batch_meta, "episode_ids": MetadataValue.json([p["episode_id"] for p in per_upload])},
     )
+    # sample 输出保留"哪个 upload 产出哪些 sample"的分组结构：下游
+    # annotation_router 需要按 upload 的 pipeline_profile 逐个路由。
     yield Output(
-        value=sample_ids,
+        value=per_upload,
         output_name="sample",
-        metadata={"num_samples": len(sample_ids), "silver_clean_strategy_id": result.get("silver_clean_strategy_id")},
+        metadata={**batch_meta, "num_samples": result["num_samples"]},
     )
-
-
-def _list_new_sample_ids(episode_id: str) -> list[str]:
-    from common.iceberg import load_table
-    from pyiceberg.expressions import EqualTo
-
-    rows = load_table("sample").scan(row_filter=EqualTo("episode_id", episode_id)).to_arrow().to_pylist()
-    return [r["sample_id"] for r in rows]
-
-
-def _safe(d: dict, keys: list[str]) -> dict:
-    return {k: d[k] for k in keys if k in d}

@@ -67,6 +67,27 @@ services:
     ports:
       - "9094:9094"
 
+  # tag 检索投影（README 3.5）：SoT 在 Iceberg，索引可整体重建，单节点无持久化即可
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+
+  # 人用的检索界面：Discover + DQL 复合查询
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.1
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      - "5601:5601"
+    depends_on:
+      - opensearch
+
   iceberg-rest:
     image: tabulario/iceberg-rest:1.6.0
     environment:

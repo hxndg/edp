@@ -75,3 +75,23 @@ class AnnotationCompleteWebhook(BaseModel):
     batch_id: str
     package_result_uri: str
     reviewer: str | None = None
+
+
+class TagSearchRequest(BaseModel):
+    """按 tag 的 key=value 组合检索对象（README 3.5），全部条件 AND 关系。"""
+
+    tags: dict[str, str] = Field(default_factory=dict, description='如 {"quality_band": "high"}')
+    target_type: str | None = Field(default=None, description="可选：episode / sample")
+    size: int = Field(default=50, ge=1, le=1000)
+
+
+class TagSearchHit(BaseModel):
+    target_type: str
+    target_id: str
+    robot_id: str | None = None
+    tags: dict[str, str] = Field(default_factory=dict)
+
+
+class TagSearchResponse(BaseModel):
+    total: int
+    hits: list[TagSearchHit]

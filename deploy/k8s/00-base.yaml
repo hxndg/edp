@@ -26,6 +26,7 @@ data:
   MINIO_ROOT_USER: minioadmin
   MINIO_ROOT_PASSWORD: minioadmin123
   MINIO_BUCKET: lake
+  OPENSEARCH_URL: http://opensearch:9200
   ICEBERG_REST_URI: http://iceberg-rest:8181
   ICEBERG_WAREHOUSE: s3://lake/warehouse
   ICEBERG_CATALOG_NAME: edp
@@ -37,6 +38,15 @@ data:
   LOG_LEVEL: INFO
   SAGA_TAKEOVER_MINUTES: "30"
   SAGA_MAX_ATTEMPTS: "3"
+  # minikube 单节点：整套基础设施 + run pod 同机，节点内存常态 90%+。Ray 的
+  # 节点级 OOM 保护（>95% 就杀最新任务）在共享节点上会误杀只用几十 MB 的
+  # mock 任务，这里关掉；生产上 Ray 跑在独立节点池时应移除此变量。
+  RAY_memory_monitor_refresh_ms: "0"
+  # pod fan-out（README 3.6.3）：run pod 给批内每个 upload 起解析 worker Job
+  # 用的镜像与命名空间。镜像与 code location / run pod 同源（edp:dev），
+  # 保证"worker 跑的代码 == 编排看到的代码"。
+  EDP_IMAGE: "edp:dev"
+  K8S_NAMESPACE: "data"
 ---
 # minikube 单节点：hostpath 动态供给的 RWO PVC 可以被同节点多个 pod 同时挂载。
 # lance PVC 挂进 code-location 和所有 run pod（K8sRunLauncher volumes 配置），
@@ -87,8 +97,9 @@ metadata:
   name: dagster
   namespace: data
 rules:
+  # jobs/status 子资源：run pod 轮询解析 worker Job 终态用（common/k8s_jobs.py）
   - apiGroups: ["batch"]
-    resources: ["jobs"]
+    resources: ["jobs", "jobs/status"]
     verbs: ["create", "get", "list", "watch", "delete"]
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events", "configmaps"]

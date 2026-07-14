@@ -1,32 +1,31 @@
-"""`ingest_append` job 的核心逻辑（README 3.2.1）：新增采集，只新建/追加。
+"""`ingest_append` job 的 run 侧逻辑（README 3.2.1 / 3.6.3）：新增采集，只新建/追加。
 
-由 `orchestration/assets/ingest.py` 里的 `ingest_append` asset 直接调用
-`run(upload_id, run_id)`。之所以直接函数调用而不是 shell 子进程：本地模式下
-Spark/Ray 的计算本来就跑在各自的 JVM/worker 进程里，Dagster 进程内的这层
-Python 代码只做参数准备和落表，符合"编排器只做控制面"的精神，同时避免了
-子进程 stdout 解析的额外复杂度。
+pod fan-out 形态（README 3.6.3）：run pod 是**控制面 + 单写者**，重活外包：
+
+    run pod                                worker pods（每 upload 一个）
+    ────────────────────────────────       ─────────────────────────────
+    claim_many（saga 互斥）
+    写 input.json 到 staging  ──────────▶  下载 MCAP → 解析 → 清洗 → 切片
+    分波起 K8s Job、轮询等待（刷心跳）        → 写 Lance → 厚表写 staging parquet
+    收 manifest.json（缺失/error→fail_one）◀─  薄表行内联在 manifest 里
+    合并全批行，每表每批一次 Iceberg commit
+    succeed_many + session done
+
+Iceberg commit 与 Saga 所有权收敛在 run pod 单写者（3.6.3 硬约束）；worker
+无状态、不碰 PG/catalog，怎么死都不影响一致性——没有清单就等于没干过。
 """
 from __future__ import annotations
 
 import logging
 
 import pyarrow as pa
-from pyiceberg.expressions import EqualTo
-
-from common import object_store
-from common.audit import make_batch_id
-from common.db import execute, fetch_one, to_json
-from common.iceberg import replace_where, upsert, with_audit_columns
-from common.saga import Saga, SagaOwnershipLostError
-from common.strategy_registry import run_strategy
-from engines.spark.ingest_common import (
-    bucket_by_window,
-    compute_quality_score,
-    read_imu_messages,
-    sha256_bytes,
-    split_s3_uri,
-    write_sample_to_lance,
-)
+from common.db import execute, fetch_all, to_json
+from common.iceberg import in_filter, replace_where, upsert
+from common.k8s_jobs import launch_parse_worker, wait_for_jobs
+from common.runtime_config import get_int
+from common.saga import SagaBatch
+from common.strategy_registry import resolve
+from engines.worker import staging
 from schemas.iceberg_tables import (
     BRONZE_IMU,
     EPISODE,
@@ -39,220 +38,218 @@ from schemas.iceberg_tables import (
 
 logger = logging.getLogger(__name__)
 
+SCOPE = "ingest_append"
+THIN_TABLE_KEYS = {
+    RAW_FILE: ["file_uri"],
+    EPISODE: ["episode_id"],
+    EPISODE_FILE: ["episode_id", "file_uri"],
+    SAMPLE: ["sample_id"],
+    GOLD_SAMPLE_INDEX: ["sample_id"],
+}
 
-def run(upload_id: str, run_id: str) -> dict:
-    """Saga 外壳（docs/saga-consistency-guide.md）：
 
-    1. claim：CAS 抢占 (ingest_append, upload_id)。sensor/定时兜底/stuck 重试
-       并发拉起多个 run 时，只有一个能抢到，其余抛 SagaConflictError 直接失败，
-       保证同一个 upload 同一时刻只有一个写者。
-    2. 各阶段 saga.advance(...) 推进步骤 + 心跳 + fencing（被接管就自杀）。
-    3. 成功 → saga SUCCEEDED + session done；异常 → saga FAILED + session failed。
-       两个终态都显式落库，"ingesting 悬空"只剩下"owner 还活着正在跑"一种含义。
+def run_batch(upload_ids: list[str], run_id: str) -> dict:
+    """批量 Saga 外壳（README 3.6.3）：claim_many 抢到的才处理；worker 级失败
+    逐条 fail_one 隔离；整批级异常（Iceberg commit 失败等）fail_many 收尾后上抛。
     """
-    session = fetch_one("SELECT * FROM upload_session WHERE upload_id = %s", (upload_id,))
-    if session is None:
-        raise ValueError(f"upload_session '{upload_id}' 不存在")
-    if session["manifest_op"] != "append":
-        raise ValueError(f"upload_session '{upload_id}' 的 manifest_op 不是 append")
+    sessions = {
+        row["upload_id"]: row
+        for row in fetch_all(
+            "SELECT * FROM upload_session WHERE upload_id = ANY(%s) AND manifest_op = 'append'",
+            (list(upload_ids),),
+        )
+    }
+    invalid = [uid for uid in upload_ids if uid not in sessions]
+    if invalid:
+        logger.warning("忽略不存在或非 append 的 upload：%s", invalid)
 
-    saga = Saga("ingest_append", upload_id, run_id)
-    saga.claim()
-    execute("UPDATE upload_session SET status = 'ingesting', updated_at = now() WHERE upload_id = %s", (upload_id,))
+    batch = SagaBatch(SCOPE, list(sessions), run_id)
+    claimed = batch.claim_many()
+    skipped = [uid for uid in sessions if uid not in claimed]
+    if claimed:
+        execute(
+            "UPDATE upload_session SET status = 'ingesting', updated_at = now() WHERE upload_id = ANY(%s)",
+            (claimed,),
+        )
 
     try:
-        result = _execute(session, upload_id, run_id, saga)
-    except SagaOwnershipLostError:
-        # 已被新 owner 接管：状态归新 owner 管，本 run 什么都不碰，直接失败退出。
-        raise
+        result = _execute_batch(sessions, claimed, run_id, batch)
     except Exception as e:  # noqa: BLE001
-        if saga.fail(f"{type(e).__name__}: {e}"):
-            execute("UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = %s", (upload_id,))
+        failed = batch.fail_many(claimed, f"{type(e).__name__}: {e}")
+        if failed:
+            execute(
+                "UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = ANY(%s) AND status = 'ingesting'",
+                (failed,),
+            )
         raise
 
-    saga.succeed()
-    execute("UPDATE upload_session SET status = 'done', updated_at = now() WHERE upload_id = %s", (upload_id,))
+    result["num_requested"] = len(upload_ids)
+    result["skipped_uploads"] = skipped + invalid
     return result
 
 
-def _execute(session: dict, upload_id: str, run_id: str, saga: Saga) -> dict:
-    manifest = session["manifest"]
-    robot_id = session["robot_id"]
-    task_id = session["task_id"]
-    batch_id = make_batch_id(robot_id=robot_id, upload_id=upload_id)
-    # 确定性 episode_id（而非随机 uuid）：同一个 upload_id 重跑会命中同一个 episode，
-    # 配合下面的 upsert 写法，保证"至少一次 + 幂等 = 最终一致"（README 2.2 原则 8）。
-    episode_id = f"ep-{upload_id}"
+def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, batch: SagaBatch) -> dict:
+    strategy = resolve("silver_clean", None)
 
-    raw_file_rows: list[dict] = []
-    all_bronze_rows: list[dict] = []
-    episode_file_rows: list[dict] = []
-    quarantined = 0
+    # ---- PARSE：fan-out 到 worker pod（每 upload 一个），失败逐条隔离 ----
+    alive = batch.advance_many("PARSE", claimed)
+    manifests, failures = _fan_out_parse(sessions, alive, run_id, batch, strategy.entrypoint)
 
-    saga.advance("PARSE")
-    for ordinal, entry in enumerate(manifest["files"]):
-        file_uri = entry["file_uri"]
-        bucket, key = split_s3_uri(file_uri)
-        data: bytes | None = None
-        try:
-            data = object_store.get_bytes(key, bucket=bucket)
-            sha256 = sha256_bytes(data)
-            bronze_rows = read_imu_messages(data)
-            if not bronze_rows:
-                raise ValueError("文件里没有解析出任何 imu 消息")
-            status = "ok"
-        except Exception:  # noqa: BLE001
-            logger.exception("file parse failed, quarantining: %s", file_uri)
-            if data is not None:
-                object_store.put_bytes(f"{object_store.PREFIX_QUARANTINE}/{upload_id}/{key.split('/')[-1]}", data)
-            execute(
-                "INSERT INTO alerts (severity, source, run_id, message, context) VALUES (%s,%s,%s,%s,%s)",
-                ("error", "ingest_append", run_id, f"quarantined file {file_uri}", to_json({"upload_id": upload_id, "file_uri": file_uri})),
-            )
-            quarantined += 1
-            raw_file_rows.append(
-                {
-                    "file_uri": file_uri,
-                    "robot_id": robot_id,
-                    "task_id": task_id,
-                    "start_ts": None,
-                    "end_ts": None,
-                    "sha256": entry.get("sha256"),
-                    "schema_version": entry.get("schema_version", "v1"),
-                    "upload_id": upload_id,
-                    "status": "quarantined",
-                }
-            )
-            continue
+    def _advance(step: str) -> list[dict]:
+        ids = batch.advance_many(step, list(manifests))
+        return [manifests[uid] for uid in ids]
 
-        ts_values = [r["ts"] for r in bronze_rows]
-        raw_file_rows.append(
-            {
-                "file_uri": file_uri,
-                "robot_id": robot_id,
-                "task_id": task_id,
-                "start_ts": min(ts_values),
-                "end_ts": max(ts_values),
-                "sha256": sha256,
-                "schema_version": entry.get("schema_version", "v1"),
-                "upload_id": upload_id,
-                "status": status,
-            }
+    # ---- INDEX：薄表（manifest 内联行）合并，每表一次 upsert commit ----
+    ms = _advance("INDEX")
+    for table in (RAW_FILE, EPISODE, EPISODE_FILE):
+        _upsert_thin(table, ms)
+
+    # ---- BRONZE / SILVER：厚表从 staging parquet 收回，事务式 replace_where
+    # （删本批 episode 旧行 + 追加新行，每表一次 commit）----
+    ms = _advance("BRONZE")
+    _replace_thick(BRONZE_IMU, ms)
+    ms = _advance("SILVER")
+    _replace_thick(SILVER_IMU, ms)
+
+    # ---- SAMPLES：sample / gold_sample_index 薄表 upsert ----
+    ms = _advance("SAMPLES")
+    _upsert_thin(SAMPLE, ms)
+    _upsert_thin(GOLD_SAMPLE_INDEX, ms)
+
+    # ---- 终态 ----
+    succeeded = batch.succeed_many([m["upload_id"] for m in ms])
+    if succeeded:
+        execute(
+            "UPDATE upload_session SET status = 'done', updated_at = now() WHERE upload_id = ANY(%s)",
+            (succeeded,),
         )
-        episode_file_rows.append({"episode_id": episode_id, "file_uri": file_uri, "ordinal": ordinal})
-        for row in bronze_rows:
-            all_bronze_rows.append(
-                {
-                    "robot_id": robot_id,
-                    "episode_id": episode_id,
-                    "source_file": file_uri,
-                    "ts": row["ts"],
-                    "seq": row["seq"],
-                    "payload_json": to_json(row["payload"]),
-                }
-            )
 
-    if not raw_file_rows or all(r["status"] == "quarantined" for r in raw_file_rows):
-        # 抛出去让 run() 的统一失败路径落 saga FAILED + session failed，
-        # Dagster run 也随之标红，比之前"静默返回 failed dict"可见性更好。
-        raise ValueError(f"upload '{upload_id}' 的全部 {quarantined} 个文件解析失败并已隔离")
-
-    start_ts = min(r["start_ts"] for r in raw_file_rows if r["start_ts"])
-    end_ts = max(r["end_ts"] for r in raw_file_rows if r["end_ts"])
-
-    episode_row = {
-        "episode_id": episode_id,
-        "robot_id": robot_id,
-        "task_id": task_id,
-        "operator": session["operator"],
-        "start_ts": start_ts,
-        "end_ts": end_ts,
-        "firmware_ver": "mock-1.0",
-        "calib_ver": "mock-1.0",
-        "agent_ver": "mock-1.0",
-        "source": "declared",
-    }
-
-    def _prep(rows: list[dict]) -> pa.Table | None:
-        if not rows:
-            return None
-        tbl = pa.Table.from_pylist(rows)
-        return with_audit_columns(tbl, batch_id=batch_id, run_id=run_id, source_uri=f"upload:{upload_id}")
-
-    def _write_upsert(table_name: str, rows: list[dict], join_cols: list[str]) -> None:
-        tbl = _prep(rows)
-        if tbl is not None:
-            upsert(table_name, tbl, join_cols=join_cols)
-
-    # 索引/目录表按主键 upsert（pyiceberg 原生 MERGE，单 commit）：
-    # 重跑同一个 upload_id 幂等，不产生重复行。
-    saga.advance("INDEX")
-    _write_upsert(RAW_FILE, raw_file_rows, ["file_uri"])
-    _write_upsert(EPISODE, [episode_row], ["episode_id"])
-    _write_upsert(EPISODE_FILE, episode_file_rows, ["episode_id", "file_uri"])
-
-    # Bronze/Silver 用事务式 replace_where（delete 本 episode 旧行 + append 新行，
-    # 单 commit）：append 模式下 episode_id 与 upload_id 一一对应，先清后写既保证
-    # 失败重跑不留重复信号行（修复旧版"纯 append 重跑会重复"的已知取舍），
-    # 也保证读者看不到"删了没写完"的中间态。
-    saga.advance("BRONZE")
-    replace_where(BRONZE_IMU, EqualTo("episode_id", episode_id), _prep(all_bronze_rows))
-
-    # 行为性替换：silver 清洗策略从 pipeline_step_config 解析（README 4.3）
-    bronze_payload_rows = [
-        {"payload": _json_loads(r["payload_json"]), "ts": r["ts"]} for r in all_bronze_rows
+    per_upload = [
+        {
+            "upload_id": m["upload_id"],
+            "episode_id": m["episode_id"],
+            "sample_ids": m["sample_ids"],
+            "num_files": m["num_files"],
+            "quarantined_files": len(m["quarantined_files"]),
+        }
+        for uid, m in manifests.items()
+        if uid in succeeded
     ]
-    strategy, silver_rows = run_strategy("silver_clean", None, bronze_payload_rows)
-    silver_table_rows = [{**r, "episode_id": episode_id, "robot_id": robot_id} for r in silver_rows]
-    saga.advance("SILVER")
-    replace_where(SILVER_IMU, EqualTo("episode_id", episode_id), _prep(silver_table_rows))
-
-    saga.advance("SAMPLES")
-    windows = bucket_by_window(silver_rows, episode_start_ts=start_ts)
-    sample_rows = []
-    gold_rows = []
-    for idx, window in sorted(windows.items()):
-        # 确定性 sample_id：同一 episode 同一窗口序号永远映射到同一个 sample_id，
-        # 这样 ingest_correct 重新切片时能用 upsert"覆盖"旧样本，而不是产生新 ID
-        # 让下游 annotation/qc_result 失去引用目标。
-        sample_id = f"{episode_id}-w{idx:04d}"
-        score, tags = compute_quality_score(window)
-        lance_uri = write_sample_to_lance(sample_id, window)
-        sample_rows.append(
-            {
-                "sample_id": sample_id,
-                "episode_id": episode_id,
-                "robot_id": robot_id,
-                "event_date": start_ts,
-                "slicer_version": "v1-fixed-window",
-                "lance_uri": lance_uri,
-                "quality_score": score,
-                "quality_tags_json": to_json(tags),
-            }
-        )
-        gold_rows.append(
-            {
-                "episode_id": episode_id,
-                "sample_id": sample_id,
-                "duration_s": 2.0,
-                "num_points": len(window),
-                "quality_score": score,
-            }
-        )
-    _write_upsert(SAMPLE, sample_rows, ["sample_id"])
-    _write_upsert(GOLD_SAMPLE_INDEX, gold_rows, ["sample_id"])
-
     return {
-        "episode_id": episode_id,
         "status": "done",
-        "num_samples": len(sample_rows),
-        "num_files": len(raw_file_rows),
-        "quarantined_files": quarantined,
+        "num_claimed": len(claimed),
+        "num_succeeded": len(succeeded),
+        "num_failed": len(failures),
+        "failures": failures,
+        "per_upload": per_upload,
+        "num_samples": sum(len(p["sample_ids"]) for p in per_upload),
+        "quarantined_files": sum(p["quarantined_files"] for p in per_upload),
         "silver_clean_strategy_id": strategy.strategy_id,
     }
 
 
-def _json_loads(s: str) -> dict:
-    import json
+def _fan_out_parse(
+    sessions: dict[str, dict],
+    upload_ids: list[str],
+    run_id: str,
+    batch: SagaBatch,
+    clean_entrypoint: str,
+    mode: str = "append",
+    extra_input: dict[str, dict] | None = None,
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """给每个 upload 起一个解析 worker（分波，受 INGEST_WORKER_MAX_PARALLEL 限制），
+    等待并收清单。返回 (成功的 {upload_id: manifest}, 失败的 {upload_id: error})。
+    ingest_correct 复用本函数（mode="correct"，extra_input 注入 episode 锚点）。
+    """
+    timeout = get_int("INGEST_WORKER_TIMEOUT_SECONDS", 600)
+    max_parallel = max(1, get_int("INGEST_WORKER_MAX_PARALLEL", 20))
 
-    return json.loads(s)
+    manifests: dict[str, dict] = {}
+    failures: dict[str, str] = {}
+
+    for i in range(0, len(upload_ids), max_parallel):
+        wave = upload_ids[i : i + max_parallel]
+        job_by_upload: dict[str, str] = {}
+        for uid in wave:
+            prefix = staging.prefix(run_id, uid)
+            payload = {
+                "mode": mode,
+                "upload_id": uid,
+                "run_id": run_id,
+                "session": {
+                    k: sessions[uid][k] for k in ("upload_id", "robot_id", "task_id", "operator", "manifest")
+                },
+                "clean_entrypoint": clean_entrypoint,
+                **({"episode": extra_input[uid]} if extra_input else {}),
+            }
+            staging.write_json(f"{prefix}/{staging.INPUT_JSON}", payload)
+            job_name = f"edp-parse-{uid}-{run_id[:8]}".lower()[:63]
+            job_by_upload[uid] = launch_parse_worker(
+                name=job_name, upload_id=uid, run_id=run_id, staging_prefix=prefix, timeout_seconds=timeout
+            )
+
+        # 等待本波结束；on_tick 刷 saga 心跳，防止等 worker 期间被 stuck sensor 接管
+        wait_for_jobs(
+            list(job_by_upload.values()),
+            timeout_seconds=timeout + 60,
+            on_tick=lambda: batch.advance_many("PARSE", list(job_by_upload)),
+        )
+
+        # 结果以 staging 里的 manifest 为准（Job 状态只是辅助）：
+        # - manifest 缺失：pod 级失败（OOM/超时/没调度上）
+        # - manifest.status=error：业务失败，worker 已把原因写进来
+        for uid, job_name in job_by_upload.items():
+            m = staging.try_read_json(f"{staging.prefix(run_id, uid)}/{staging.MANIFEST_JSON}")
+            if m is None:
+                _fail_upload(batch, uid, f"worker {job_name} 无清单（pod 级失败：超时/OOM/未调度）", run_id, failures)
+            elif m.get("status") != "ok":
+                _fail_upload(batch, uid, m.get("error", "worker 报告未知错误"), run_id, failures)
+            else:
+                manifests[uid] = m
+                for file_uri in m.get("quarantined_files", []):
+                    execute(
+                        "INSERT INTO alerts (severity, source, run_id, message, context) VALUES (%s,%s,%s,%s,%s)",
+                        ("error", batch.scope, run_id, f"quarantined file {file_uri}", to_json({"upload_id": uid, "file_uri": file_uri})),
+                    )
+    return manifests, failures
+
+
+def _fail_upload(batch: SagaBatch, upload_id: str, error: str, run_id: str, failures: dict[str, str]) -> None:
+    failures[upload_id] = error
+    if batch.fail_one(upload_id, error):
+        execute(
+            "UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = %s AND status = 'ingesting'",
+            (upload_id,),
+        )
+        execute(
+            "INSERT INTO alerts (severity, source, run_id, message, context) VALUES (%s,%s,%s,%s,%s)",
+            (
+                "error",
+                batch.scope,
+                run_id,
+                f"upload {upload_id} 解析失败，已逐条隔离（同批其他 upload 不受影响）",
+                to_json({"upload_id": upload_id, "error": error}),
+            ),
+        )
+
+
+def _upsert_thin(table: str, manifests: list[dict]) -> None:
+    rows: list[dict] = []
+    for m in manifests:
+        rows.extend(m.get("thin_rows", {}).get(table, []))
+    if rows:
+        upsert(table, pa.Table.from_pylist(rows), join_cols=THIN_TABLE_KEYS[table])
+
+
+def _replace_thick(table: str, manifests: list[dict]) -> None:
+    """本批所有 worker 的 staging parquet 合并 → 删本批 episode 旧行 + 追加，单 commit。"""
+    if not manifests:
+        return
+    episode_ids = [m["episode_id"] for m in manifests]
+    tables = []
+    for m in manifests:
+        ref = m.get("thick_files", {}).get(table)
+        if ref:
+            tables.append(staging.read_parquet(ref["key"]))
+    merged = pa.concat_tables(tables, promote_options="default") if tables else None
+    replace_where(table, in_filter("episode_id", episode_ids), merged)

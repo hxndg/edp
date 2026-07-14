@@ -51,6 +51,9 @@ class Settings:
     iceberg_warehouse: str = field(default_factory=lambda: _env("ICEBERG_WAREHOUSE", "s3://lake/warehouse"))
     iceberg_catalog_name: str = field(default_factory=lambda: _env("ICEBERG_CATALOG_NAME", "edp"))
 
+    # OpenSearch（tag 检索投影，README 3.5；SoT 在 Iceberg，索引可整体重建）
+    opensearch_url: str = field(default_factory=lambda: _env("OPENSEARCH_URL", "http://localhost:9200"))
+
     # Gateway / Dagster
     gateway_host: str = field(default_factory=lambda: _env("GATEWAY_HOST", "0.0.0.0"))
     gateway_port: int = field(default_factory=lambda: int(_env("GATEWAY_PORT", "8000")))
@@ -64,6 +67,14 @@ class Settings:
     saga_takeover_minutes: int = field(default_factory=lambda: int(_env("SAGA_TAKEOVER_MINUTES", "30")))
     # stuck 自动重试上限：超过后不再自动入队，转为 failed + alert 等人工介入
     saga_max_attempts: int = field(default_factory=lambda: int(_env("SAGA_MAX_ATTEMPTS", "3")))
+
+    # pod fan-out（README 3.6.3）：run pod 给批内每个 upload 起 worker Job 用的镜像
+    # 与命名空间。镜像默认复用 code location 注入的 DAGSTER_CURRENT_IMAGE——
+    # "worker 跑的代码 == 编排看到的代码"，与 run pod 同源。
+    edp_image: str = field(
+        default_factory=lambda: _env("EDP_IMAGE", os.environ.get("DAGSTER_CURRENT_IMAGE", "edp:dev"))
+    )
+    k8s_namespace: str = field(default_factory=lambda: _env("K8S_NAMESPACE", "data"))
 
     @property
     def platform_dsn(self) -> str:

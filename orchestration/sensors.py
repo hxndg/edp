@@ -1,27 +1,44 @@
-"""触发层（README 2.3 / 4.1，云上形态见 docs/saga-consistency-guide.md 讨论）。
+"""触发层（README 2.3 / 4.1 / 3.6，云上形态见 docs/saga-consistency-guide.md 讨论）。
 
-本版把 ingest 的实时触发从"轮询 Postgres"换成"消费 Kafka"（方案 A）：
-gateway 提交 manifest 后向 `edp.ingest.requests` 发一条 ingest.requested，
-`ingest_kafka_sensor` 消费它、按 manifest_op 路由到 append/correct 两个 job。
+ingest 的实时触发消费 Kafka（方案 A）：gateway 提交 manifest 后向
+`edp.ingest.requests` 发一条 ingest.requested，`ingest_kafka_sensor` 消费它。
+
+微批 + 背压（README 3.6.2）：sensor 每个 tick 先做在跑批次背压检查（达上限
+本轮不消费，消息留在 Kafka 排队），然后拉最多 INGEST_BATCH_MAX 条消息、按
+manifest_op 分成至多两组（append/correct 是两个 job、两套引擎、两个 saga
+scope），**每组 = 一个批次 = 一个 RunRequest = 一个 run pod**，`run_config`
+携带该组的 upload_ids 列表。run 数量由 tick 间隔与批次上限决定，与上传量解耦。
 
 可靠性模型（至少一次触发 + 三层去重/互斥）：
 - offset 存在 Dagster sensor cursor 里，和 RunRequest 的提交一起持久化，
   不用 Kafka 自身的 group commit——避免"offset 提交了、run 没发出去"的缝隙；
-- 消息重复/重放：sensor 先查 PG，只有 status=ready 才发 RunRequest（廉价跳过）；
-  再有 run_key 去重；最终引擎侧 saga.claim() CAS 保证同一 upload 只有一个写者；
+- 消息重复/重放：sensor 先查 PG，只有 status=ready 才进批（廉价跳过）；
+  再有 run_key（批内容摘要）去重；最终引擎侧 SagaBatch.claim_many() 的
+  逐 upload CAS 保证同一 upload 只有一个写者；
 - Kafka 消息丢了/发失败：T+1 兜底 schedule 仍然轮询 PG（见 schedules.py），
-  ready 的会话最迟第二天早上被补触发。
+  ready 的会话最迟第二天早上被补触发（同样按微批合并）。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 
-from dagster import DefaultSensorStatus, RunRequest, SensorResult, SkipReason, sensor
+from dagster import DagsterRunStatus, DefaultSensorStatus, RunRequest, RunsFilter, SensorResult, SkipReason, sensor
 
 from common.config import settings
-from common.db import execute, fetch_all, fetch_one, to_json
+from common.db import execute, fetch_all, to_json
+from common.runtime_config import get_int
 from orchestration.jobs import annotation_collect_job, ingest_append_job, ingest_correct_job
-from orchestration.partitions import upload_sessions_partitions_def
+
+INGEST_JOB_NAMES = ("ingest_append_job", "ingest_correct_job")
+
+# "在跑"= 已提交但还没到终态：排队中 + 启动中 + 执行中
+_INFLIGHT_STATUSES = [
+    DagsterRunStatus.QUEUED,
+    DagsterRunStatus.NOT_STARTED,
+    DagsterRunStatus.STARTING,
+    DagsterRunStatus.STARTED,
+]
 
 
 def _pending_upload_rows(manifest_op: str) -> list[dict]:
@@ -31,20 +48,54 @@ def _pending_upload_rows(manifest_op: str) -> list[dict]:
     )
 
 
-def _run_key(manifest_op: str, row: dict) -> str:
-    """run_key = op + upload_id + updated_at 时间戳。
+def _batch_run_key(manifest_op: str, rows: list[dict]) -> str:
+    """run_key = op + 批内容摘要（upload_id + updated_at 的有序哈希）。
 
-    带上 updated_at 的意义（docs/saga-consistency-guide.md）：Dagster 对同一个
-    run_key 只会创建一次 run，如果上一个 run 崩溃了、状态被 stuck sensor 重置回
-    ready（updated_at 随之刷新），新的 run_key 才能触发新 run——纯 `op-upload_id`
-    的旧写法会因为 run_key 已消费而永远无法重试。kafka sensor 与 T+1 兜底
-    schedule 共用这个规则，两条触发路径互相去重。
+    带上 updated_at 的意义（docs/saga-consistency-guide.md）：上一个 run 崩溃后
+    stuck sensor 把会话重置回 ready 时会刷新 updated_at，重组出的批才有新
+    run_key，能触发新 run。批次成员不同 → run_key 不同，所以跨触发路径
+    （kafka sensor / T+1 兜底）的 run_key 去重只挡"完全相同的批"；真正的
+    互斥兜底在引擎侧 SagaBatch.claim_many() 的逐 upload CAS。
     """
-    return f"{manifest_op}-{row['upload_id']}-{int(row['updated_at'].timestamp())}"
+    digest = hashlib.sha256(
+        "|".join(sorted(f"{r['upload_id']}:{int(r['updated_at'].timestamp())}" for r in rows)).encode()
+    ).hexdigest()
+    return f"{manifest_op}-batch-{digest[:16]}"
 
 
-def _consume_ingest_requests(cursor: dict[str, int]) -> tuple[list[dict], dict[str, int]]:
-    """从 cursor 记录的 offset 开始消费一批 ingest.requested 消息。
+def _batch_run_request(manifest_op: str, rows: list[dict], trigger: str) -> RunRequest:
+    """一个批次 → 一个 RunRequest（README 3.6.2）：upload_ids 走 run_config，
+    批大小/触发路径打进 tags（UI 可搜）。"""
+    upload_ids = [r["upload_id"] for r in rows]
+    job_name = "ingest_append_job" if manifest_op == "append" else "ingest_correct_job"
+    return RunRequest(
+        job_name=job_name,
+        run_key=_batch_run_key(manifest_op, rows),
+        run_config={
+            "ops": {
+                "ingest_multi_asset": {
+                    "config": {"upload_ids": upload_ids, "manifest_op": manifest_op}
+                }
+            },
+            # run pod 内步骤串行执行：ingest 链路本身接近线性（entity_tag 与
+            # prelabel 是仅有的并行位），串行几乎不损吞吐，却把 Spark/Ray/DuckDB
+            # 同时起在一个 pod 里的峰值内存压力砍半——批的并行度由"多个批次
+            # 多个 pod"承担（3.6.2 背压控制），不靠 pod 内多进程。
+            "execution": {"config": {"multiprocess": {"max_concurrent": 1}}},
+        },
+        tags={"trigger": trigger, "manifest_op": manifest_op, "batch_size": str(len(upload_ids))},
+    )
+
+
+def _inflight_ingest_batches(instance) -> int:
+    return sum(
+        instance.get_runs_count(RunsFilter(job_name=name, statuses=_INFLIGHT_STATUSES))
+        for name in INGEST_JOB_NAMES
+    )
+
+
+def _consume_ingest_requests(cursor: dict[str, int], max_messages: int) -> tuple[list[dict], dict[str, int]]:
+    """从 cursor 记录的 offset 开始消费最多 max_messages 条 ingest.requested 消息。
 
     返回 (消息列表, 新 cursor)。cursor 形如 {"0": 42} —— partition 号 → 下一条
     要读的 offset。不用 Kafka consumer group：offset 的"提交"就是 Dagster 持久化
@@ -76,7 +127,7 @@ def _consume_ingest_requests(cursor: dict[str, int]) -> tuple[list[dict], dict[s
 
         messages: list[dict] = []
         new_cursor = dict(cursor)
-        batches = consumer.poll(timeout_ms=2000, max_records=200)
+        batches = consumer.poll(timeout_ms=2000, max_records=max_messages)
         for tp, records in batches.items():
             for rec in records:
                 messages.append(rec.value)
@@ -88,62 +139,62 @@ def _consume_ingest_requests(cursor: dict[str, int]) -> tuple[list[dict], dict[s
 
 @sensor(
     jobs=[ingest_append_job, ingest_correct_job],
-    minimum_interval_seconds=5,
+    minimum_interval_seconds=30,
     default_status=DefaultSensorStatus.RUNNING,
-    description="消费 Kafka edp.ingest.requests，按 manifest_op 路由拉起 ingest_append/ingest_correct（方案 A）",
+    description="消费 Kafka edp.ingest.requests，微批合并 + 在跑批次背压，按 manifest_op 分批拉起 ingest job（README 3.6.2）",
 )
 def ingest_kafka_sensor(context):
     cursor: dict[str, int] = json.loads(context.cursor) if context.cursor else {}
+
+    # 1. 运行时配置（PG runtime_config，UPDATE 后下个 tick 生效）
+    batch_max = get_int("INGEST_BATCH_MAX", 200)
+    max_inflight = get_int("INGEST_MAX_INFLIGHT_BATCHES", 3)
+
+    # 2. 源头背压：在跑批次达上限 → 本轮不消费，offset 不动，积压留在 Kafka
+    #    （最擅长积压的地方），不产生 run 记录、不写 PG。
+    inflight = _inflight_ingest_batches(context.instance)
+    if inflight >= max_inflight:
+        return SkipReason(f"背压：{inflight} 个 ingest 批次在跑（上限 {max_inflight}），本轮不消费 Kafka")
+
+    # 3. 拉最多 batch_max 条消息
     try:
-        messages, new_cursor = _consume_ingest_requests(cursor)
+        messages, new_cursor = _consume_ingest_requests(cursor, batch_max)
     except Exception as e:  # noqa: BLE001 - Kafka 不可达时跳过本轮，下一轮重试；兜底 schedule 仍在
         return SkipReason(f"kafka 不可达，跳过本轮：{type(e).__name__}: {e}")
 
     if not messages:
         return SensorResult(run_requests=[], cursor=json.dumps(new_cursor))
 
-    run_requests: list[RunRequest] = []
-    new_partition_keys: list[str] = []
-    existing_partitions = set(context.instance.get_dynamic_partitions(upload_sessions_partitions_def.name))
+    # 4. 校验 status=ready（PG 是状态真相，done/failed/ingesting 的重放消息廉价
+    #    跳过），一次批量查询；按 manifest_op 分组
+    requested_ids: list[str] = []
     seen: set[str] = set()
-
     for msg in messages:
-        payload = msg.get("payload", {})
-        upload_id = payload.get("upload_id")
-        if not upload_id or upload_id in seen:
-            continue
-        seen.add(upload_id)
+        upload_id = msg.get("payload", {}).get("upload_id")
+        if upload_id and upload_id not in seen:
+            seen.add(upload_id)
+            requested_ids.append(upload_id)
 
-        # PG 是状态真相：只有 ready 才值得起 run。done/failed/ingesting 的重放消息
-        # 在这里被廉价跳过，不产生垃圾 run。
-        row = fetch_one(
-            "SELECT upload_id, manifest_op, updated_at FROM upload_session WHERE upload_id = %s AND status = 'ready'",
-            (upload_id,),
+    ready_rows = fetch_all(
+        "SELECT upload_id, manifest_op, updated_at FROM upload_session WHERE upload_id = ANY(%s) AND status = 'ready'",
+        (requested_ids,),
+    ) if requested_ids else []
+    skipped = len(requested_ids) - len(ready_rows)
+    if skipped:
+        context.log.info("跳过 %s 条非 ready 的重放/过期消息", skipped)
+
+    groups: dict[str, list[dict]] = {}
+    for row in ready_rows:
+        groups.setdefault(row["manifest_op"], []).append(row)
+
+    # 5. 每组（至多两组：append/correct）= 一个批次 = 一个 RunRequest = 一个 run pod
+    run_requests = [_batch_run_request(op, rows, trigger="kafka") for op, rows in groups.items()]
+    if run_requests:
+        context.log.info(
+            "微批触发：%s",
+            ", ".join(f"{rr.tags['manifest_op']}×{rr.tags['batch_size']}" for rr in run_requests),
         )
-        if row is None:
-            context.log.info("skip ingest request for %s: session 不存在或非 ready", upload_id)
-            continue
-
-        manifest_op = row["manifest_op"]
-        job_name = "ingest_append_job" if manifest_op == "append" else "ingest_correct_job"
-        if upload_id not in existing_partitions:
-            new_partition_keys.append(upload_id)
-        run_requests.append(
-            RunRequest(
-                job_name=job_name,
-                run_key=_run_key(manifest_op, row),
-                partition_key=upload_id,
-                tags={"upload_id": upload_id, "trigger": "kafka"},
-            )
-        )
-
-    return SensorResult(
-        run_requests=run_requests,
-        cursor=json.dumps(new_cursor),
-        dynamic_partitions_requests=(
-            [upload_sessions_partitions_def.build_add_request(new_partition_keys)] if new_partition_keys else []
-        ),
-    )
+    return SensorResult(run_requests=run_requests, cursor=json.dumps(new_cursor))
 
 
 @sensor(
@@ -239,5 +290,11 @@ def annotation_collect_sensor(context):
     靠轮询 `annotation_batch.status = RETURNED` 兜底唤醒 job-B（README 3.2.2）。
     """
     rows = fetch_all("SELECT batch_id FROM annotation_batch WHERE status = 'RETURNED'")
-    run_requests = [RunRequest(run_key=f"collect-{r['batch_id']}", partition_key=r["batch_id"]) for r in rows]
-    return run_requests
+    return [
+        RunRequest(
+            run_key=f"collect-{r['batch_id']}",
+            run_config={"ops": {"annotation_collect": {"config": {"batch_id": r["batch_id"]}}}},
+            tags={"batch_id": r["batch_id"]},
+        )
+        for r in rows
+    ]

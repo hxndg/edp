@@ -175,6 +175,126 @@ class Saga:
         return row is not None
 
 
+class SagaBatch:
+    """同一 scope 下一批 business_id 的批量 Saga 句柄（README 3.6.3）。
+
+    **锁粒度仍然是单个 business_id（upload_id）**——批次不是稳定的业务身份
+    （重试时批次重组），互斥必须锁在稳定身份上。批量只体现在执行形态：
+    每个阶段用一条 SQL 对整批刷 step/心跳，语义与单条版 `Saga` 完全一致。
+
+    用法（engines/spark/ingest_append.py::run_batch）：
+
+        batch = SagaBatch("ingest_append", upload_ids, run_id)
+        claimed = batch.claim_many()          # 抢到的才处理，没抢到的跳过
+        alive = batch.advance_many("INDEX", claimed)   # 返回仍归本 run 的子集
+        batch.fail_one(uid, "...")            # 逐条失败隔离，不拖垮同批
+        batch.succeed_many(alive)
+    """
+
+    def __init__(self, scope: str, business_ids: list[str], run_id: str):
+        self.scope = scope
+        self.business_ids = list(business_ids)
+        self.run_id = run_id
+        self.attempts: dict[str, int] = {}
+        _ensure_table()
+
+    def claim_many(self) -> list[str]:
+        """批量 CAS 抢占，一条 SQL。可抢占条件与 `Saga.claim` 相同（从未跑过 /
+        已终结 / 心跳超时），返回**抢到的子集**；没抢到的说明另一个 run 正持有
+        （并发批次撞车是预期行为），调用方直接跳过它们，不算错误。
+        """
+        if not self.business_ids:
+            return []
+        rows = fetch_all(
+            """
+            INSERT INTO saga_log (scope, business_id, run_id, status, step, attempt)
+            SELECT %(scope)s, unnest(%(bids)s::text[]), %(rid)s, 'RUNNING', 'CLAIM', 1
+            ON CONFLICT (scope, business_id) DO UPDATE SET
+                run_id = EXCLUDED.run_id,
+                status = 'RUNNING',
+                step = 'CLAIM',
+                attempt = saga_log.attempt + 1,
+                error = NULL,
+                started_at = now(),
+                updated_at = now()
+            WHERE saga_log.status <> 'RUNNING'
+               OR saga_log.updated_at < now() - make_interval(mins => %(takeover)s)
+            RETURNING business_id, attempt
+            """,
+            {
+                "scope": self.scope,
+                "bids": self.business_ids,
+                "rid": self.run_id,
+                "takeover": settings.saga_takeover_minutes,
+            },
+        )
+        self.attempts = {r["business_id"]: r["attempt"] for r in rows}
+        return [r["business_id"] for r in rows]
+
+    def advance_many(self, step: str, business_ids: list[str]) -> list[str]:
+        """批量推进步骤 + 刷新心跳，一条 SQL。WHERE 带 run_id 做 fencing：
+        返回**仍归本 run 所有**的子集；没返回的已被新 owner 接管，调用方应把
+        它们从后续所有写入中剔除（数据世界留给新 owner）。
+        """
+        if not business_ids:
+            return []
+        rows = fetch_all(
+            """
+            UPDATE saga_log SET step = %(step)s, updated_at = now()
+            WHERE scope = %(scope)s AND business_id = ANY(%(bids)s)
+              AND run_id = %(rid)s AND status = 'RUNNING'
+            RETURNING business_id
+            """,
+            {"step": step, "scope": self.scope, "bids": list(business_ids), "rid": self.run_id},
+        )
+        return [r["business_id"] for r in rows]
+
+    def succeed_many(self, business_ids: list[str]) -> list[str]:
+        """批量落 SUCCEEDED 终态，返回实际写入终态的子集（被接管的除外）。"""
+        if not business_ids:
+            return []
+        rows = fetch_all(
+            """
+            UPDATE saga_log SET status = 'SUCCEEDED', step = 'COMMIT', updated_at = now()
+            WHERE scope = %(scope)s AND business_id = ANY(%(bids)s)
+              AND run_id = %(rid)s AND status = 'RUNNING'
+            RETURNING business_id
+            """,
+            {"scope": self.scope, "bids": list(business_ids), "rid": self.run_id},
+        )
+        return [r["business_id"] for r in rows]
+
+    def fail_one(self, business_id: str, error: str) -> bool:
+        """单条落 FAILED 终态（逐条失败隔离：某个 upload 的毒数据不拖垮同批）。
+        返回 False 表示已被接管，本 run 不应再改它的任何状态。
+        """
+        row = fetch_one(
+            """
+            UPDATE saga_log SET status = 'FAILED', error = %(err)s, updated_at = now()
+            WHERE scope = %(scope)s AND business_id = %(bid)s
+              AND run_id = %(rid)s AND status = 'RUNNING'
+            RETURNING step
+            """,
+            {"err": error[:2000], "scope": self.scope, "bid": business_id, "rid": self.run_id},
+        )
+        return row is not None
+
+    def fail_many(self, business_ids: list[str], error: str) -> list[str]:
+        """批量落 FAILED（整批级异常，如 Iceberg commit 失败时兜底收尾）。"""
+        if not business_ids:
+            return []
+        rows = fetch_all(
+            """
+            UPDATE saga_log SET status = 'FAILED', error = %(err)s, updated_at = now()
+            WHERE scope = %(scope)s AND business_id = ANY(%(bids)s)
+              AND run_id = %(rid)s AND status = 'RUNNING'
+            RETURNING business_id
+            """,
+            {"err": error[:2000], "scope": self.scope, "bids": list(business_ids), "rid": self.run_id},
+        )
+        return [r["business_id"] for r in rows]
+
+
 def uncommitted_episode_ids() -> list[str]:
     """下游读侧过滤用：返回"业务上尚未 COMMIT"的 episode_id 列表。
 

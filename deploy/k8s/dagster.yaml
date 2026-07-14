@@ -9,6 +9,21 @@ storage:
       db_name: dagster
       port: 5432
 
+# DAGSTER_HOME 是只读的 configmap 挂载，本地工件（sensor tick 日志捕获、
+# compute log 等临时文件）必须指到可写路径，否则 sensor 里 context.log 会报
+# "Read-only file system"。这些只是缓存/日志捕获，真相在 PG，放 /tmp 即可。
+local_artifact_storage:
+  module: dagster.core.storage.root
+  class: LocalArtifactStorage
+  config:
+    base_dir: /tmp/dagster-artifacts
+
+compute_logs:
+  module: dagster.core.storage.local_compute_log_manager
+  class: LocalComputeLogManager
+  config:
+    base_dir: /tmp/dagster-compute-logs
+
 run_coordinator:
   module: dagster.core.run_coordinator
   class: QueuedRunCoordinator
@@ -36,7 +51,7 @@ run_launcher:
       - name: lance
         mountPath: /data/lance
 
-# tick 历史保留（run 本身的 30 天清理见 orchestration/schedules.py 的维护 job 讨论）
+# tick 历史保留（run 本身的 30 天清理由 orchestration/retention.py 的 retention_job 负责）
 retention:
   schedule:
     purge_after_days: 30

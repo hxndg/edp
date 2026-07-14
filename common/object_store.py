@@ -93,3 +93,25 @@ def list_prefix(prefix: str, *, bucket: str | None = None) -> list[str]:
         for obj in page.get("Contents", []):
             keys.append(obj["Key"])
     return keys
+
+
+def list_prefix_with_mtime(prefix: str, *, bucket: str | None = None) -> list[tuple[str, "object"]]:
+    """返回 [(key, last_modified)]，retention job 按 mtime 清理 staging 用。"""
+    bucket = bucket or settings.minio_bucket
+    paginator = client().get_paginator("list_objects_v2")
+    out: list[tuple[str, object]] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            out.append((obj["Key"], obj["LastModified"]))
+    return out
+
+
+def delete_keys(keys: list[str], *, bucket: str | None = None) -> int:
+    bucket = bucket or settings.minio_bucket
+    c = client()
+    for i in range(0, len(keys), 1000):  # S3 DeleteObjects 单次上限 1000
+        c.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in keys[i : i + 1000]], "Quiet": True},
+        )
+    return len(keys)

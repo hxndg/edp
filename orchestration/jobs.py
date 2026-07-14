@@ -13,8 +13,6 @@ from __future__ import annotations
 
 from dagster import define_asset_job
 
-from orchestration.partitions import upload_sessions_partitions_def
-
 _INGEST_AND_ANNOTATE_SELECTION = [
     "raw_file",
     "episode",
@@ -24,27 +22,25 @@ _INGEST_AND_ANNOTATE_SELECTION = [
     "annotation_dispatch",
     "qc_result",
     "entity_tag",
+    "entity_tag_index",
 ]
 
 ingest_append_job = define_asset_job(
     name="ingest_append_job",
     selection=_INGEST_AND_ANNOTATE_SELECTION,
-    partitions_def=upload_sessions_partitions_def,
-    description="README 3.2.1：manifest_op=append 触发的入湖 + 预标 + 路由链路",
+    description="README 3.2.1 / 3.6：manifest_op=append 的微批入湖 + 预标 + 路由链路（run_config 传 upload_ids）",
 )
 
 ingest_correct_job = define_asset_job(
     name="ingest_correct_job",
     selection=_INGEST_AND_ANNOTATE_SELECTION,
-    partitions_def=upload_sessions_partitions_def,
-    description="README 3.2.1：manifest_op=correct 触发的范围限定 backfill + 重新标注链路",
+    description="README 3.2.1 / 3.6：manifest_op=correct 的微批范围限定 backfill + 重新标注链路",
 )
 
 annotation_collect_job = define_asset_job(
     name="annotation_collect_job",
     selection=["annotation_collect", "qc_result"],
-    partitions_def=upload_sessions_partitions_def,
-    description="README 3.2.2：标注 CLI 提交结果后，收活 + 质检",
+    description="README 3.2.2：标注 CLI 提交结果后，收活 + 质检（run_config 传 batch_id）",
 )
 
 freeze_dataset_job = define_asset_job(
