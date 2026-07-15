@@ -851,24 +851,28 @@ tick
 
 `ingest_stuck_sensor` 与读侧过滤 `uncommitted_episode_ids()` 逻辑不变（本来就是 upload/episode 粒度）。
 
-**批内执行形态：pod fan-out（已实现）**。触发/背压设计只管"批"，与批内计算形态解耦；批内最重的活（下载 MCAP → 解析 → 清洗 → 切片 → 写 Lance）不在 run pod 里做，而是**每个 upload 一个 worker pod**（普通 K8s Job，`common/k8s_jobs.py`）：
+**批内执行形态：pod fan-out（已实现，详解见 `docs/pod-fanout-guide.md`）**。触发/背压设计只管"批"，与批内计算形态解耦；批内最重的活（下载 MCAP → 解析 → 清洗 → 切片 → 写 Lance）不在 run pod 里做，而是**每个 upload 一个 worker pod**，用 **Dagster Pipes（`PipesK8sClient`，`common/worker_pods.py`）** 拉起：
 
 ```text
-run pod（控制面 + 单写者）                 worker pods（每 upload 一个）
-────────────────────────────────         ─────────────────────────────
+run pod（控制面 + 单写者）                     worker pods（每 upload 一个）
+──────────────────────────────────           ─────────────────────────────
 claim_many（saga 互斥）
-写 input.json 到 staging  ─────────────▶  下载 MCAP → 解析 → 清洗 → 切片
-分波起 K8s Job、轮询等待（刷 saga 心跳）      → 写 Lance → 厚表写 staging parquet
-收 manifest.json（缺失/error → fail_one）◀──  薄表行内联在 manifest 里返回
-合并全批行，每表每批一次 Iceberg commit
-succeed_many + session done
+写 input.json 到 staging  ───────────────▶   下载 MCAP 到本地盘 → 流式解析/清洗
+Pipes 分波起 pod（worker 日志流回本 run）         → 切片写 Lance → 厚表分块写 staging parquet
+监视线程：刷 saga 心跳 + 抓 pod 终态快照
+收 manifest.json（薄表行 + error_code 内联）◀──  业务失败也写清单（带状态码）后正常退出
+  无清单 → 按 pod 终态推断 OOM/超时/丢失
+每表每批一次 Iceberg commit（事务内分块追加）
+succeed_many + session done；失败按码进重试层
 ```
 
-- **worker 无状态**：只碰对象存储（staging / raw / quarantine）和 Lance 卷，**不连 PG、不碰 Iceberg catalog**。输入全部由 run pod 预先写进 `staging/{run_id}/{upload_id}/input.json`（session 快照、清洗策略入口、correct 模式的 episode 锚点），worker 怎么死都不影响一致性——没有清单就等于没干过。
-- **失败语义收敛到 upload 粒度**：业务失败（解析不出来）→ worker 把 error 写进 manifest 后**正常退出**；pod 级失败（OOM/超时/调度不上）→ 没有 manifest。两种都由 run pod 对该 upload `fail_one` + alert，同批其他照常。Job 设 `backoffLimit=0`——重试语义归 saga attempt 计数 + stuck sensor 管，不用 K8s 自带重试（会绕过 saga 计数）。
-- **超时两层**：worker 侧 `activeDeadlineSeconds`（`runtime_config.INGEST_WORKER_TIMEOUT_SECONDS`，默认 600s，卡死的 worker 被 K8s 杀掉）；run pod 侧等待循环有总超时，兜底 pod 一直 Pending 调度不上的情况，且**每轮轮询刷一次 saga 心跳**，防止等 worker 期间被 stuck sensor 误判 owner 已死。
-- **分波调度**：批内 worker 受 `INGEST_WORKER_MAX_PARALLEL`（默认 20）限制分波起，200 条的批分 10 波，不会一次打爆节点。
-- **worker 镜像与 run pod 同源**（`edp-env` 的 `EDP_IMAGE`，默认同 `edp:dev`），保证"worker 跑的代码 == 编排看到的代码"；完成的 Job 保留 1 小时供查日志（`ttlSecondsAfterFinished`），staging 残留由 retention job 按 mtime 清（`STAGING_RETENTION_DAYS`，默认 7 天，有意不在 run 结束时删——保留现场方便排查）。
+- **worker 无状态**：只碰对象存储（staging / raw / quarantine）和 Lance 卷，**不连 PG、不碰 Iceberg catalog、不调 K8s API**。输入全部由 run pod 预先写进 `staging/{run_id}/{upload_id}/input.json`（session 快照、清洗策略入口、correct 模式的 episode 锚点、chunk 大小），worker 怎么死都不影响一致性——没有清单就等于没干过。
+- **Pipes 是观测通道，manifest 是数据契约**：worker 的 stdout 实时流回本 run 的 compute log（Dagster UI 一处看全批日志），完成小结/错误也经 pipes 消息上报；但薄表行、厚表文件引用、`error_code` 的真相在 staging 的 `manifest.json` 里——数据不受日志通道限制，worker 本地可脱离 Dagster 直接运行。
+- **两端内存都与数据量解耦**：worker 流式解析（文件落盘下载 + 每 `INGEST_WORKER_CHUNK_ROWS` 行 flush 一个 parquet row group + 切片窗口按水位线关闭），峰值 ≈ 一个 chunk；run pod 收厚表用 `replace_where_chunked`——同一 Iceberg 事务内逐 worker、逐 row group 追加，**快照提交仍是一次**，不再把全批 concat 进内存。
+- **失败语义 = 状态码（`common/errors.py`）**：业务失败（数据的问题）→ worker 自报 `DATA_PARSE_ERROR`/`DATA_EMPTY` 等，写进 manifest 后正常退出；pod 级失败 → 无清单，run 侧从监视线程抓到的 pod 终态推断 `WORKER_OOM`/`WORKER_TIMEOUT`/`WORKER_LOST`（死掉的进程自报不了）；整批级 → `COMMIT_CONFLICT`/`PG_ERROR`。码落 `saga_log.error_code`，逐条 `fail_one` 隔离，同批其他照常。
+- **重试按码分类**：瞬时故障（存储抖动等）由 stuck sensor 退避后自动重试；OOM/超时自动重试且 worker 内存按 `INGEST_WORKER_MEMORY_TIERS` 逐 attempt 升档；数据问题**不自动重试**，等人工——入口有两个：Dagster UI Re-execute（整批重放，`run_batch` 以 PG 状态为起点、done 的廉价跳过）和 gateway `POST /sessions/{id}/retry`（单 upload 精确重跑）。
+- **超时两层**：worker pod `activeDeadlineSeconds`（`INGEST_WORKER_TIMEOUT_SECONDS`，默认 600s）；run 侧等待兜底 +120s，覆盖 pod 一直 Pending 调度不上的情况。
+- **分波调度**：批内 worker 受 `INGEST_WORKER_MAX_PARALLEL`（默认 20）限制分波起，200 条的批分 10 波，不会一次打爆节点。worker 镜像与 run pod 同源（`edp-env` 的 `EDP_IMAGE`）；pod 由 Pipes 用后即删，现场靠流回的日志 + staging 清单 + `saga_log.error_code`；staging 残留由 retention job 按 mtime 清（`STAGING_RETENTION_DAYS`，默认 7 天，有意不在 run 结束时删——保留现场方便排查）。
 
 不随形态变的**硬约束**：无论批内怎么并行，**Iceberg commit 与 Saga 所有权必须收敛在 run 层的单写者**。若 worker 各自 commit，等于退回"每上传一次 commit"，200 个写者还会在 catalog 的乐观并发控制上互相冲突重试；saga 的 fencing token 也无法再保证互斥。
 
@@ -894,10 +898,11 @@ succeed_many + session done
 1. ✅ `schemas/postgres_platform.sql`：`runtime_config` 表 + 默认值（`common/runtime_config.py` 读取，老部署由模块幂等建表）。
 2. ✅ `orchestration/sensors.py`：微批合并 + 在跑批次背压 + `run_config` 传 `upload_ids`；T+1 兜底 schedule 同步改批量（`orchestration/schedules.py`）；动态分区移除（`orchestration/partitions.py` 已删除，`annotation_collect` 的 batch_id 走 run_config）。
 3. ✅ `common/saga.py::SagaBatch`：`claim_many/advance_many/succeed_many/fail_one/fail_many` 批量原语。
-4. ✅ `engines/spark/ingest_append.py` / `ingest_correct.py`：`run_batch` 批处理——PARSE 阶段 pod fan-out（失败逐条隔离），后续阶段合并写入、每表每批一次 commit（run pod 单写者）。
-5. ✅ pod fan-out（3.6.3）：`common/k8s_jobs.py`（worker Job 创建/等待，`backoffLimit=0` + `activeDeadlineSeconds` + 心跳回调）、`engines/worker/staging.py`（input.json / manifest.json / 厚表 parquet 交接约定）、`engines/worker/ingest_parse.py`（worker 入口，append/correct 两模式）。
-6. ✅ `orchestration/retention.py` + `retention_schedule`（每日 04:00）：删 30 天前的终态 Dagster run（连带 event log）与 PG 终态行（saga_log / annotation_batch DONE / upload_session done|failed），外加 staging 交接区按 mtime 清 7 天前残留。
-7. ⏳ backlog：`entity_tag_index` 从全量重建改增量（按本批 target 同步），保留全量重建入口做对账（3.5.1 相应更新）。当前数据量全量重建耗时可接受，暂不动。
+4. ✅ `engines/spark/ingest_append.py` / `ingest_correct.py`：`run_batch` 批处理——PARSE 阶段 pod fan-out（失败逐条隔离），后续阶段每表每批一次 commit（run pod 单写者，`replace_where_chunked` 事务内分块追加）；以 PG 状态为起点（done 跳过），UI Re-execute 安全。
+5. ✅ pod fan-out（3.6.3，详解 `docs/pod-fanout-guide.md`）：`common/worker_pods.py`（PipesK8sClient 拉起 + 线程池并发 + 监视线程刷心跳/抓 pod 终态）、`engines/worker/staging.py`（input.json / manifest.json / 厚表 parquet 交接约定）、`engines/worker/ingest_parse.py`（worker 入口，流式解析 + 分块写 + 水位线切片，append/correct 两模式）。
+6. ✅ 错误码与重试（`common/errors.py`）：状态码三来源（worker 自报 / pod 终态推断 / run 侧自身）+ 按码重试策略（RETRYABLE 自动重试、OOM/超时重试且内存升档、数据问题等人工）；`saga_log.error_code` 列；stuck sensor 增加按码自动重试；gateway `POST /sessions/{id}/retry` 人工单条重试。Pipes 形态 2026-07-15 minikube 回归通过（正向链路 / 同批失败隔离 + `DATA_EMPTY` 自报码 / NOT_RETRYABLE 不自动重试 / gateway retry 200+409），逐行代码审核文档见 `docs/pipes-fanout-code-review.md`。
+7. ✅ `orchestration/retention.py` + `retention_schedule`（每日 04:00）：删 30 天前的终态 Dagster run（连带 event log）与 PG 终态行（saga_log / annotation_batch DONE / upload_session done|failed），外加 staging 交接区按 mtime 清 7 天前残留。
+8. ⏳ backlog：`entity_tag_index` 从全量重建改增量（按本批 target 同步），保留全量重建入口做对账（3.5.1 相应更新）。当前数据量全量重建耗时可接受，暂不动。
 
 ---
 

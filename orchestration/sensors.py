@@ -119,11 +119,20 @@ def _consume_ingest_requests(cursor: dict[str, int], max_messages: int) -> tuple
 
         tps = [TopicPartition(topic, p) for p in sorted(partitions)]
         consumer.assign(tps)
+        beginnings = consumer.beginning_offsets(tps)
+        ends = consumer.end_offsets(tps)
         for tp in tps:
-            if str(tp.partition) in cursor:
-                consumer.seek(tp, cursor[str(tp.partition)])
-            else:
+            stored = cursor.get(str(tp.partition))
+            if stored is None:
                 consumer.seek_to_beginning(tp)  # 首次启动从头读：老消息会被 status 校验廉价跳过
+            elif stored < beginnings[tp] or stored > ends[tp]:
+                # cursor 越界：retention 清掉了旧段（stored < lo），或 broker 无持久卷
+                # 重启/topic 重建导致日志缩水（stored > hi）。后者若不校准，seek 会指向
+                # 不存在的 offset，poll 永远拉不到消息——新消息的 offset 也小于 cursor，
+                # 触发链路整体失明。回到最早可读处，重放消息由 status=ready 校验廉价跳过。
+                consumer.seek(tp, beginnings[tp])
+            else:
+                consumer.seek(tp, stored)
 
         messages: list[dict] = []
         new_cursor = dict(cursor)
@@ -201,12 +210,13 @@ def ingest_kafka_sensor(context):
     job=ingest_append_job,
     minimum_interval_seconds=60,
     default_status=DefaultSensorStatus.RUNNING,
-    description="Saga 卡死看护：心跳超时的 ingesting 会话重新入队（有次数上限），超限转 failed + alert",
+    description="Saga 看护：卡死会话重新入队；failed 会话按 error_code 分类自动重试（有次数上限）",
 )
 def ingest_stuck_sensor(context):
-    """处理"run 挂了、状态悬在 ingesting"的场景（docs/saga-consistency-guide.md）。
+    """处理"run 挂了/失败了，状态需要修复"的场景（docs/saga-consistency-guide.md、
+    docs/pod-fanout-guide.md 错误处理）。
 
-    本 sensor 不直接发 RunRequest，只做两类状态修复，修复后向 Kafka 补发一条
+    本 sensor 不直接发 RunRequest，只做三类状态修复，修复后向 Kafka 补发一条
     ingest.requested（由 ingest_kafka_sensor 按新 run_key 重新拉起）；即使这里的
     判断和一个"其实还活着"的旧 run 撞车，新 run 的 saga.claim() CAS 也只允许
     一个写者，不会双写。补发的 Kafka 消息丢了也没关系，T+1 兜底 schedule 轮询
@@ -214,11 +224,21 @@ def ingest_stuck_sensor(context):
 
     1. status=ingesting 且 saga 心跳超时：owner 大概率已死。
        attempt < 上限 → 重置回 ready（updated_at 刷新 → 新 run_key）+ 补发触发事件；
-       attempt 达上限 → saga/session 都落 failed 终态 + alert，等人工介入。
+       attempt 达上限 → saga/session 都落 failed 终态（error_code=STUCK_EXHAUSTED）
+       + alert，等人工介入。
     2. status=ready 放了很久没被拉起：典型原因是触发消息丢了，或上一个 run 在
        claim 之前就崩了、run_key 已被消费。刷新 updated_at 生成新 run_key 并补发
        触发事件。
+    3. status=failed 且 error_code 可自动重试（common/errors.py RETRY_POLICY）：
+       - RETRYABLE（存储抖动/worker 丢失/commit 冲突等瞬时故障）：退避
+         INGEST_RETRY_BACKOFF_MINUTES 后重置回 ready；
+       - NEEDS_ANALYSIS（OOM/超时）：同样重试，但 claim 的 attempt 递增会让
+         worker 内存按 INGEST_WORKER_MEMORY_TIERS 自动升档——"先怀疑资源，
+         升档再试"；到 attempt 上限仍失败就停手（失败时已有 alert）；
+       - NOT_RETRYABLE（数据解析失败/数据为空）：不碰——数据不修，重试一万次
+         结果一样，等人工修数据后走 gateway retry API 或重传。
     """
+    from common.errors import Retry, retry_policy
     from common.kafka_ledger import emit_ingest_request
     stale = fetch_all(
         """
@@ -244,7 +264,8 @@ def ingest_stuck_sensor(context):
             # 达到重试上限：CAS 收尾（条件重查心跳，避免误杀刚被新 run 接管的 saga）
             execute(
                 """
-                UPDATE saga_log SET status = 'FAILED', error = 'stuck: 心跳超时且重试次数耗尽', updated_at = now()
+                UPDATE saga_log SET status = 'FAILED', error_code = 'STUCK_EXHAUSTED',
+                       error = 'stuck: 心跳超时且重试次数耗尽', updated_at = now()
                 WHERE scope = %s AND business_id = %s AND status = 'RUNNING'
                   AND updated_at < now() - make_interval(mins => %s)
                 """,
@@ -278,10 +299,39 @@ def ingest_stuck_sensor(context):
     for row in dangling:
         emit_ingest_request(row["upload_id"], row["manifest_op"])
 
-    if requeued or exhausted:
-        context.log.warning("stuck sessions: requeued=%s, exhausted=%s", requeued, exhausted)
-        return SkipReason(f"修复了 {requeued} 个重新入队、{exhausted} 个转 failed 的卡死会话")
-    return SkipReason("没有卡死的 ingest 会话")
+    # failed 且按码可自动重试：退避到期后重置回 ready（docstring 第 3 类）
+    backoff = get_int("INGEST_RETRY_BACKOFF_MINUTES", 5)
+    failed_rows = fetch_all(
+        """
+        SELECT us.upload_id, us.manifest_op, sl.error_code, sl.attempt
+        FROM upload_session us
+        JOIN saga_log sl
+          ON sl.business_id = us.upload_id AND sl.scope = 'ingest_' || us.manifest_op
+        WHERE us.status = 'failed' AND sl.status = 'FAILED'
+          AND sl.attempt < %s
+          AND sl.updated_at < now() - make_interval(mins => %s)
+        """,
+        (settings.saga_max_attempts, backoff),
+    )
+    retried = 0
+    for row in failed_rows:
+        if retry_policy(row["error_code"]) == Retry.NOT_RETRYABLE:
+            continue
+        execute(
+            "UPDATE upload_session SET status = 'ready', updated_at = now() WHERE upload_id = %s AND status = 'failed'",
+            (row["upload_id"],),
+        )
+        emit_ingest_request(row["upload_id"], row["manifest_op"])
+        context.log.info(
+            "自动重试 upload %s（error_code=%s, 下一次是第 %s 次尝试）",
+            row["upload_id"], row["error_code"], row["attempt"] + 1,
+        )
+        retried += 1
+
+    if requeued or exhausted or retried:
+        context.log.warning("saga 看护：requeued=%s, exhausted=%s, auto_retried=%s", requeued, exhausted, retried)
+        return SkipReason(f"修复 {requeued} 个卡死重入队、{exhausted} 个转 failed、{retried} 个按码自动重试")
+    return SkipReason("没有需要修复的 ingest 会话")
 
 
 @sensor(job=annotation_collect_job, minimum_interval_seconds=30, default_status=DefaultSensorStatus.RUNNING)

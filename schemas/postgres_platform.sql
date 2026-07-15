@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS saga_log (
                         CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED')),
     step                TEXT NOT NULL DEFAULT 'CLAIM',  -- 最近推进到的步骤，advance() 时更新（兼作心跳）
     attempt             INT  NOT NULL DEFAULT 1,        -- 第几次尝试，claim 接管时 +1，用于限制自动重试
+    error_code          TEXT,                           -- common/errors.py 状态码，重试层按它决定是否自动重试
     error               TEXT,
     started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -103,6 +104,9 @@ INSERT INTO runtime_config (key, value, description) VALUES
     ('RETENTION_DAYS', '30', 'Dagster run 记录与 PG 终态行的保留天数（README 3.6.4）'),
     ('INGEST_WORKER_TIMEOUT_SECONDS', '600', '单个解析 worker pod 的硬超时（README 3.6.3，activeDeadlineSeconds）'),
     ('INGEST_WORKER_MAX_PARALLEL', '20', '同时在跑的解析 worker pod 数上限（README 3.6.3，分波调度）'),
+    ('INGEST_WORKER_MEMORY_TIERS', '1Gi,2Gi,4Gi', 'worker 内存 limit 按 saga attempt 升档（OOM 自动重试时用更高档）'),
+    ('INGEST_WORKER_CHUNK_ROWS', '50000', 'worker 流式解析的分块行数（bronze/silver 每 N 行 flush 一个 row group）'),
+    ('INGEST_RETRY_BACKOFF_MINUTES', '5', 'failed 会话按 error_code 自动重试前的退避分钟数（stuck sensor）'),
     ('STAGING_RETENTION_DAYS', '7', 'MinIO staging/ 交接区残留文件的保留天数（README 3.6.3，retention job 按 mtime 清）')
 ON CONFLICT (key) DO NOTHING;
 

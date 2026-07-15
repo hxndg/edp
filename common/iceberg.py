@@ -182,9 +182,23 @@ def replace_where(table_name: str, delete_filter, arrow_table: pa.Table | None) 
 
     arrow_table 传 None / 空表时退化为纯删除（同样是一次 commit）。
     """
+    return replace_where_chunked(table_name, delete_filter, [arrow_table] if arrow_table is not None else [])
+
+
+def replace_where_chunked(table_name: str, delete_filter, arrow_tables) -> Table:
+    """`replace_where` 的分块版：同一个事务内逐块 append，**仍是一次 commit**。
+
+    服务 pod fan-out 的收数场景（README 3.6.3）：一批 200 个 upload 的
+    bronze/silver 行如果先 concat 成一张大 arrow 表再写，run pod 峰值内存 =
+    全批数据量，会 OOM。这里让调用方传一个惰性可迭代（逐个读 worker 的
+    staging parquet、逐 row group 产出），每块 append 完内存即释放——
+    事务内多次 append 只是多写几个数据文件，快照提交仍然只有一次，
+    读者看到的原子性与单块版完全相同。
+    """
     tbl = load_table(table_name)
     with tbl.transaction() as txn:
         txn.delete(delete_filter=delete_filter)
-        if arrow_table is not None and arrow_table.num_rows > 0:
-            txn.append(_align_to_table_schema(arrow_table, tbl))
+        for chunk in arrow_tables:
+            if chunk is not None and chunk.num_rows > 0:
+                txn.append(_align_to_table_schema(chunk, tbl))
     return tbl

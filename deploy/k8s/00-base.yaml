@@ -97,12 +97,18 @@ metadata:
   name: dagster
   namespace: data
 rules:
-  # jobs/status 子资源：run pod 轮询解析 worker Job 终态用（common/k8s_jobs.py）
+  # K8sRunLauncher 起 run pod 走的是 batch Job（dagster-k8s 默认形态）
   - apiGroups: ["batch"]
     resources: ["jobs", "jobs/status"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # 解析 worker 走 PipesK8sClient 直接建 pod（common/worker_pods.py）：
+  # create/delete 是起/收 pod，pods/log 的 get 是把 worker 日志流回 run 的
+  # compute log（follow 模式），list/watch 是监视线程抓 pod 终态快照
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "events", "configmaps"]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log", "events", "configmaps"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -135,6 +135,44 @@ def submit_manifest(upload_id: str, req: ManifestSubmitRequest) -> dict:
     return {"upload_id": upload_id, "status": "ready", "manifest_op": session["manifest_op"]}
 
 
+@app.post("/sessions/{upload_id}/retry")
+def retry_session(upload_id: str) -> dict:
+    """人工重试入口（docs/pod-fanout-guide.md 错误处理）：把 failed 的会话重置回
+    ready 并补发触发事件。适合"数据/环境已修好，重跑这一个 upload"的场景——
+    和 Dagster UI 的 Re-execute（整批以 PG 状态为起点重放，done 的廉价跳过）
+    互补：这里是单 upload 粒度、不需要找到原来的 run。
+
+    只允许 failed → ready：done 没什么可重试的（要重写数据走 correct 流程）；
+    ready/ingesting 说明系统正在处理或即将处理，人工插手只会制造并发。
+    重置 updated_at → 新 run_key；引擎侧 saga claim 的 attempt 会继续累加，
+    OOM 类失败重试时 worker 内存自动升档（INGEST_WORKER_MEMORY_TIERS）。
+    """
+    session = _get_session_or_404(upload_id)
+    if session["status"] != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"只有 failed 的会话可以重试，当前状态是 '{session['status']}'",
+        )
+    last_error = fetch_one(
+        "SELECT error_code, error, attempt FROM saga_log WHERE business_id = %s AND scope = 'ingest_' || %s",
+        (upload_id, session["manifest_op"]),
+    )
+    execute(
+        "UPDATE upload_session SET status = 'ready', updated_at = now() WHERE upload_id = %s AND status = 'failed'",
+        (upload_id,),
+    )
+    emit("upload.retry_requested", key=upload_id, payload={"upload_id": upload_id, "source": "gateway"})
+    emit_ingest_request(upload_id, session["manifest_op"])
+    return {
+        "upload_id": upload_id,
+        "status": "ready",
+        "manifest_op": session["manifest_op"],
+        "previous_attempt": last_error["attempt"] if last_error else None,
+        "previous_error_code": last_error["error_code"] if last_error else None,
+        "previous_error": last_error["error"] if last_error else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 建数据集请求（README 4.1：API 触发）
 # ---------------------------------------------------------------------------

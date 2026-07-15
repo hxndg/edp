@@ -1,30 +1,40 @@
 """`ingest_append` job 的 run 侧逻辑（README 3.2.1 / 3.6.3）：新增采集，只新建/追加。
 
-pod fan-out 形态（README 3.6.3）：run pod 是**控制面 + 单写者**，重活外包：
+pod fan-out 形态（README 3.6.3，讲解见 docs/pod-fanout-guide.md）：run pod 是
+**控制面 + 单写者**，重活外包：
 
     run pod                                worker pods（每 upload 一个）
     ────────────────────────────────       ─────────────────────────────
     claim_many（saga 互斥）
-    写 input.json 到 staging  ──────────▶  下载 MCAP → 解析 → 清洗 → 切片
-    分波起 K8s Job、轮询等待（刷心跳）        → 写 Lance → 厚表写 staging parquet
-    收 manifest.json（缺失/error→fail_one）◀─  薄表行内联在 manifest 里
+    写 input.json 到 staging  ──────────▶  下载 MCAP → 流式解析/清洗/切片
+    Pipes 分波起 pod（日志流回本 run）        → 写 Lance → 厚表分块写 staging parquet
+    收 manifest.json（缺失→查 pod 终态定码）◀─  薄表行 + error_code 内联在 manifest 里
     合并全批行，每表每批一次 Iceberg commit
     succeed_many + session done
 
-Iceberg commit 与 Saga 所有权收敛在 run pod 单写者（3.6.3 硬约束）；worker
-无状态、不碰 PG/catalog，怎么死都不影响一致性——没有清单就等于没干过。
+失败语义（common/errors.py）：
+- worker 业务失败：manifest 里带 error_code（worker 自报）→ fail_one 逐条隔离；
+- pod 级失败（OOM/超时/丢失）：无清单 → 按 pod 终态推断码 → fail_one；
+- 整批级（commit 冲突/PG 挂）：classify_exception 定码 → fail_many 收尾后上抛。
+重试由触发层按码决定（orchestration/sensors.py），OOM 重试时 worker 内存自动升档。
+
+**以 PG 状态为起点**：本函数只处理 status ≠ done 的 session。这让 Dagster UI 的
+Re-execute（run_config 里的 upload_ids 原样重放）天然安全——已成功的 upload
+被廉价跳过，只重跑失败/悬置的那部分。
 """
 from __future__ import annotations
 
 import logging
 
 import pyarrow as pa
+
 from common.db import execute, fetch_all, to_json
-from common.iceberg import in_filter, replace_where, upsert
-from common.k8s_jobs import launch_parse_worker, wait_for_jobs
-from common.runtime_config import get_int
+from common.errors import ErrorCode, classify_exception, format_error
+from common.iceberg import in_filter, replace_where_chunked, upsert
+from common.runtime_config import get_int, get_str
 from common.saga import SagaBatch
 from common.strategy_registry import resolve
+from common.worker_pods import WorkerSpec, launch_wave
 from engines.worker import staging
 from schemas.iceberg_tables import (
     BRONZE_IMU,
@@ -48,20 +58,20 @@ THIN_TABLE_KEYS = {
 }
 
 
-def run_batch(upload_ids: list[str], run_id: str) -> dict:
-    """批量 Saga 外壳（README 3.6.3）：claim_many 抢到的才处理；worker 级失败
-    逐条 fail_one 隔离；整批级异常（Iceberg commit 失败等）fail_many 收尾后上抛。
-    """
+def run_batch(upload_ids: list[str], op_context) -> dict:
+    """批量 Saga 外壳（README 3.6.3）。op_context 是 Dagster 的执行上下文：
+    run_id 从它取，Pipes 客户端用它把 worker 日志流回本 run。"""
+    run_id = op_context.run_id
     sessions = {
         row["upload_id"]: row
         for row in fetch_all(
-            "SELECT * FROM upload_session WHERE upload_id = ANY(%s) AND manifest_op = 'append'",
+            "SELECT * FROM upload_session WHERE upload_id = ANY(%s) AND manifest_op = 'append' AND status <> 'done'",
             (list(upload_ids),),
         )
     }
-    invalid = [uid for uid in upload_ids if uid not in sessions]
-    if invalid:
-        logger.warning("忽略不存在或非 append 的 upload：%s", invalid)
+    not_pending = [uid for uid in upload_ids if uid not in sessions]
+    if not_pending:
+        logger.info("跳过不存在/非 append/已 done 的 upload：%s", not_pending)
 
     batch = SagaBatch(SCOPE, list(sessions), run_id)
     claimed = batch.claim_many()
@@ -73,9 +83,10 @@ def run_batch(upload_ids: list[str], run_id: str) -> dict:
         )
 
     try:
-        result = _execute_batch(sessions, claimed, run_id, batch)
-    except Exception as e:  # noqa: BLE001
-        failed = batch.fail_many(claimed, f"{type(e).__name__}: {e}")
+        result = _execute_batch(sessions, claimed, run_id, batch, op_context)
+    except Exception as e:  # noqa: BLE001 - 整批级异常（典型：Iceberg commit / PG 故障）
+        code = classify_exception(e, where="run")
+        failed = batch.fail_many(claimed, format_error(code, f"{type(e).__name__}: {e}"), error_code=code.value)
         if failed:
             execute(
                 "UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = ANY(%s) AND status = 'ingesting'",
@@ -84,16 +95,16 @@ def run_batch(upload_ids: list[str], run_id: str) -> dict:
         raise
 
     result["num_requested"] = len(upload_ids)
-    result["skipped_uploads"] = skipped + invalid
+    result["skipped_uploads"] = skipped + not_pending
     return result
 
 
-def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, batch: SagaBatch) -> dict:
+def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, batch: SagaBatch, op_context) -> dict:
     strategy = resolve("silver_clean", None)
 
     # ---- PARSE：fan-out 到 worker pod（每 upload 一个），失败逐条隔离 ----
     alive = batch.advance_many("PARSE", claimed)
-    manifests, failures = _fan_out_parse(sessions, alive, run_id, batch, strategy.entrypoint)
+    manifests, failures = _fan_out_parse(sessions, alive, run_id, batch, strategy.entrypoint, op_context)
 
     def _advance(step: str) -> list[dict]:
         ids = batch.advance_many(step, list(manifests))
@@ -104,8 +115,8 @@ def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, b
     for table in (RAW_FILE, EPISODE, EPISODE_FILE):
         _upsert_thin(table, ms)
 
-    # ---- BRONZE / SILVER：厚表从 staging parquet 收回，事务式 replace_where
-    # （删本批 episode 旧行 + 追加新行，每表一次 commit）----
+    # ---- BRONZE / SILVER：厚表从 staging 逐 row group 收回，事务内分块追加，
+    # 每表仍是一次 commit（内存与批大小解耦，见 replace_where_chunked）----
     ms = _advance("BRONZE")
     _replace_thick(BRONZE_IMU, ms)
     ms = _advance("SILVER")
@@ -148,28 +159,36 @@ def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, b
     }
 
 
+def _memory_tier(attempt: int, tiers: list[str]) -> str:
+    """attempt 1 用第 1 档，OOM 后重试逐档升，到顶封顶。"""
+    return tiers[min(max(attempt, 1), len(tiers)) - 1]
+
+
 def _fan_out_parse(
     sessions: dict[str, dict],
     upload_ids: list[str],
     run_id: str,
     batch: SagaBatch,
     clean_entrypoint: str,
+    op_context,
     mode: str = "append",
     extra_input: dict[str, dict] | None = None,
 ) -> tuple[dict[str, dict], dict[str, str]]:
     """给每个 upload 起一个解析 worker（分波，受 INGEST_WORKER_MAX_PARALLEL 限制），
-    等待并收清单。返回 (成功的 {upload_id: manifest}, 失败的 {upload_id: error})。
+    等待并收清单。返回 (成功的 {upload_id: manifest}, 失败的 {upload_id: "[CODE] msg"})。
     ingest_correct 复用本函数（mode="correct"，extra_input 注入 episode 锚点）。
     """
     timeout = get_int("INGEST_WORKER_TIMEOUT_SECONDS", 600)
     max_parallel = max(1, get_int("INGEST_WORKER_MAX_PARALLEL", 20))
+    chunk_rows = get_int("INGEST_WORKER_CHUNK_ROWS", 50000)
+    tiers = [t.strip() for t in get_str("INGEST_WORKER_MEMORY_TIERS", "1Gi,2Gi,4Gi").split(",") if t.strip()]
 
     manifests: dict[str, dict] = {}
     failures: dict[str, str] = {}
 
     for i in range(0, len(upload_ids), max_parallel):
         wave = upload_ids[i : i + max_parallel]
-        job_by_upload: dict[str, str] = {}
+        specs: list[WorkerSpec] = []
         for uid in wave:
             prefix = staging.prefix(run_id, uid)
             payload = {
@@ -180,30 +199,37 @@ def _fan_out_parse(
                     k: sessions[uid][k] for k in ("upload_id", "robot_id", "task_id", "operator", "manifest")
                 },
                 "clean_entrypoint": clean_entrypoint,
+                "chunk_rows": chunk_rows,
                 **({"episode": extra_input[uid]} if extra_input else {}),
             }
             staging.write_json(f"{prefix}/{staging.INPUT_JSON}", payload)
-            job_name = f"edp-parse-{uid}-{run_id[:8]}".lower()[:63]
-            job_by_upload[uid] = launch_parse_worker(
-                name=job_name, upload_id=uid, run_id=run_id, staging_prefix=prefix, timeout_seconds=timeout
+            specs.append(
+                WorkerSpec(
+                    upload_id=uid,
+                    staging_prefix=prefix,
+                    memory_limit=_memory_tier(batch.attempts.get(uid, 1), tiers),
+                )
             )
 
-        # 等待本波结束；on_tick 刷 saga 心跳，防止等 worker 期间被 stuck sensor 接管
-        wait_for_jobs(
-            list(job_by_upload.values()),
-            timeout_seconds=timeout + 60,
-            on_tick=lambda: batch.advance_many("PARSE", list(job_by_upload)),
+        outcomes = launch_wave(
+            op_context,
+            specs,
+            run_id=run_id,
+            timeout_seconds=timeout,
+            # 心跳（防 stuck sensor 误判）：只刷本波，返回值不用——fencing 在
+            # 每个写入阶段的 advance_many 边界统一执行
+            heartbeat=lambda ids=list(wave): batch.advance_many("PARSE", ids),
         )
 
-        # 结果以 staging 里的 manifest 为准（Job 状态只是辅助）：
-        # - manifest 缺失：pod 级失败（OOM/超时/没调度上）
-        # - manifest.status=error：业务失败，worker 已把原因写进来
-        for uid, job_name in job_by_upload.items():
+        # 真相判定：有清单看清单（worker 自报的 error_code），无清单查 pod 终态
+        for uid in wave:
             m = staging.try_read_json(f"{staging.prefix(run_id, uid)}/{staging.MANIFEST_JSON}")
             if m is None:
-                _fail_upload(batch, uid, f"worker {job_name} 无清单（pod 级失败：超时/OOM/未调度）", run_id, failures)
+                code, detail = outcomes[uid].classify()
+                _fail_upload(batch, uid, code, detail, run_id, failures)
             elif m.get("status") != "ok":
-                _fail_upload(batch, uid, m.get("error", "worker 报告未知错误"), run_id, failures)
+                code = ErrorCode(m.get("error_code") or ErrorCode.INTERNAL.value)
+                _fail_upload(batch, uid, code, m.get("error", "worker 报告未知错误"), run_id, failures)
             else:
                 manifests[uid] = m
                 for file_uri in m.get("quarantined_files", []):
@@ -214,9 +240,12 @@ def _fan_out_parse(
     return manifests, failures
 
 
-def _fail_upload(batch: SagaBatch, upload_id: str, error: str, run_id: str, failures: dict[str, str]) -> None:
+def _fail_upload(
+    batch: SagaBatch, upload_id: str, code: ErrorCode, message: str, run_id: str, failures: dict[str, str]
+) -> None:
+    error = format_error(code, message)
     failures[upload_id] = error
-    if batch.fail_one(upload_id, error):
+    if batch.fail_one(upload_id, error, error_code=code.value):
         execute(
             "UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = %s AND status = 'ingesting'",
             (upload_id,),
@@ -227,8 +256,8 @@ def _fail_upload(batch: SagaBatch, upload_id: str, error: str, run_id: str, fail
                 "error",
                 batch.scope,
                 run_id,
-                f"upload {upload_id} 解析失败，已逐条隔离（同批其他 upload 不受影响）",
-                to_json({"upload_id": upload_id, "error": error}),
+                f"upload {upload_id} 解析失败已隔离（同批其他不受影响）：{error}",
+                to_json({"upload_id": upload_id, "error_code": code.value, "error": message}),
             ),
         )
 
@@ -242,14 +271,15 @@ def _upsert_thin(table: str, manifests: list[dict]) -> None:
 
 
 def _replace_thick(table: str, manifests: list[dict]) -> None:
-    """本批所有 worker 的 staging parquet 合并 → 删本批 episode 旧行 + 追加，单 commit。"""
+    """本批 episode 旧行删除 + 各 worker 的 staging parquet 逐 row group 追加，
+    同一事务单 commit；任何时刻内存里只有一个 row group（≈ chunk_rows 行）。"""
     if not manifests:
         return
-    episode_ids = [m["episode_id"] for m in manifests]
-    tables = []
-    for m in manifests:
-        ref = m.get("thick_files", {}).get(table)
-        if ref:
-            tables.append(staging.read_parquet(ref["key"]))
-    merged = pa.concat_tables(tables, promote_options="default") if tables else None
-    replace_where(table, in_filter("episode_id", episode_ids), merged)
+
+    def _batches():
+        for m in manifests:
+            ref = m.get("thick_files", {}).get(table)
+            if ref:
+                yield from staging.iter_parquet_batches(ref["key"])
+
+    replace_where_chunked(table, in_filter("episode_id", [m["episode_id"] for m in manifests]), _batches())

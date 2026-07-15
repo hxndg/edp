@@ -36,12 +36,16 @@ CREATE TABLE IF NOT EXISTS saga_log (
                         CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED')),
     step                TEXT NOT NULL DEFAULT 'CLAIM',
     attempt             INT  NOT NULL DEFAULT 1,
+    error_code          TEXT,
     error               TEXT,
     started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (scope, business_id)
 )
 """
+
+# 老部署的表没有 error_code 列（common/errors.py 引入前建的），幂等补列
+_MIGRATE = "ALTER TABLE saga_log ADD COLUMN IF NOT EXISTS error_code TEXT"
 
 _ddl_lock = threading.Lock()
 _ddl_done = False
@@ -54,6 +58,7 @@ def _ensure_table() -> None:
     with _ddl_lock:
         if not _ddl_done:
             execute(_DDL)
+            execute(_MIGRATE)
             _ddl_done = True
 
 
@@ -103,6 +108,7 @@ class Saga:
                 step = 'CLAIM',
                 attempt = saga_log.attempt + 1,
                 error = NULL,
+                error_code = NULL,
                 started_at = now(),
                 updated_at = now()
             WHERE saga_log.status <> 'RUNNING'
@@ -159,18 +165,19 @@ class Saga:
                 f"本 run {self.run_id} 的结果以新 owner 为准"
             )
 
-    def fail(self, error: str) -> bool:
+    def fail(self, error: str, error_code: str | None = None) -> bool:
         """落 FAILED 终态。返回 True 表示本 run 仍是 owner、终态写入成功；
         返回 False 表示已被接管（新 owner 正在重跑），本 run 不应再改任何状态。
+        error_code 是 common/errors.py 的状态码，重试层按它决定要不要自动重试。
         """
         row = fetch_one(
             """
-            UPDATE saga_log SET status = 'FAILED', error = %(err)s, updated_at = now()
+            UPDATE saga_log SET status = 'FAILED', error = %(err)s, error_code = %(code)s, updated_at = now()
             WHERE scope = %(scope)s AND business_id = %(bid)s
               AND run_id = %(rid)s AND status = 'RUNNING'
             RETURNING step
             """,
-            {"err": error[:2000], "scope": self.scope, "bid": self.business_id, "rid": self.run_id},
+            {"err": error[:2000], "code": error_code, "scope": self.scope, "bid": self.business_id, "rid": self.run_id},
         )
         return row is not None
 
@@ -215,6 +222,7 @@ class SagaBatch:
                 step = 'CLAIM',
                 attempt = saga_log.attempt + 1,
                 error = NULL,
+                error_code = NULL,
                 started_at = now(),
                 updated_at = now()
             WHERE saga_log.status <> 'RUNNING'
@@ -264,33 +272,34 @@ class SagaBatch:
         )
         return [r["business_id"] for r in rows]
 
-    def fail_one(self, business_id: str, error: str) -> bool:
+    def fail_one(self, business_id: str, error: str, error_code: str | None = None) -> bool:
         """单条落 FAILED 终态（逐条失败隔离：某个 upload 的毒数据不拖垮同批）。
         返回 False 表示已被接管，本 run 不应再改它的任何状态。
+        error_code 决定这条 upload 会不会被自动重试（common/errors.py RETRY_POLICY）。
         """
         row = fetch_one(
             """
-            UPDATE saga_log SET status = 'FAILED', error = %(err)s, updated_at = now()
+            UPDATE saga_log SET status = 'FAILED', error = %(err)s, error_code = %(code)s, updated_at = now()
             WHERE scope = %(scope)s AND business_id = %(bid)s
               AND run_id = %(rid)s AND status = 'RUNNING'
             RETURNING step
             """,
-            {"err": error[:2000], "scope": self.scope, "bid": business_id, "rid": self.run_id},
+            {"err": error[:2000], "code": error_code, "scope": self.scope, "bid": business_id, "rid": self.run_id},
         )
         return row is not None
 
-    def fail_many(self, business_ids: list[str], error: str) -> list[str]:
+    def fail_many(self, business_ids: list[str], error: str, error_code: str | None = None) -> list[str]:
         """批量落 FAILED（整批级异常，如 Iceberg commit 失败时兜底收尾）。"""
         if not business_ids:
             return []
         rows = fetch_all(
             """
-            UPDATE saga_log SET status = 'FAILED', error = %(err)s, updated_at = now()
+            UPDATE saga_log SET status = 'FAILED', error = %(err)s, error_code = %(code)s, updated_at = now()
             WHERE scope = %(scope)s AND business_id = ANY(%(bids)s)
               AND run_id = %(rid)s AND status = 'RUNNING'
             RETURNING business_id
             """,
-            {"err": error[:2000], "scope": self.scope, "bids": list(business_ids), "rid": self.run_id},
+            {"err": error[:2000], "code": error_code, "scope": self.scope, "bids": list(business_ids), "rid": self.run_id},
         )
         return [r["business_id"] for r in rows]
 

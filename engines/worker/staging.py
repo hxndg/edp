@@ -82,3 +82,15 @@ def write_parquet(key: str, rows: list[dict]) -> int:
 
 def read_parquet(key: str) -> pa.Table:
     return pq.read_table(io.BytesIO(object_store.get_bytes(key)))
+
+
+def iter_parquet_batches(key: str):
+    """逐 row group 产出一个 staging parquet 的内容（run pod 收厚表数据用）。
+
+    内存 = 一个文件的字节 + 一个 row group（worker 侧 _ChunkedWriter 保证
+    row group ≈ chunk_rows 行），配合 `replace_where_chunked` 让 run pod
+    收全批数据的峰值内存与批大小解耦。
+    """
+    pf = pq.ParquetFile(io.BytesIO(object_store.get_bytes(key)))
+    for i in range(pf.num_row_groups):
+        yield pf.read_row_group(i)
