@@ -18,6 +18,9 @@ class FreezeDatasetConfig(Config):
     filter_expr: dict = {}
     quality_threshold: float = 0.0
     split: dict = {}
+    # 手工挑样本（README 3.7.2）：非空时跳过 Spark 条件圈选与质量门，
+    # 只校验样本存在后直接冻结——训练侧永远只认冻出来的 dataset_version
+    sample_ids: list[str] = []
 
 
 @asset(
@@ -37,6 +40,7 @@ def dataset_asset(context: AssetExecutionContext, config: FreezeDatasetConfig) -
             quality_threshold=config.quality_threshold,
             split=config.split,
             run_id=context.run_id,
+            sample_ids=config.sample_ids,
         )
     except FreezeGateError as e:
         execute(

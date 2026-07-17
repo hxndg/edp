@@ -63,6 +63,8 @@ class DatasetRequestIn(BaseModel):
     filter_expr: dict = Field(default_factory=dict)
     quality_threshold: float = 0.0
     split: dict = Field(default_factory=dict)
+    # 手工挑样本（README 3.7.2）：非空时跳过条件圈选，直接冻结这份清单
+    sample_ids: list[str] = Field(default_factory=list)
 
 
 class DatasetRequestOut(BaseModel):
@@ -95,3 +97,38 @@ class TagSearchHit(BaseModel):
 class TagSearchResponse(BaseModel):
     total: int
     hits: list[TagSearchHit]
+
+
+# ---------------------------------------------------------------------------
+# 模型训练与管理（README 3.7）
+# ---------------------------------------------------------------------------
+
+class TrainRequestIn(BaseModel):
+    """发起训练。复现配方四元组的用户侧三元：dataset_version + params + seed
+    （第四元 image 由部署决定）。seed 不填由网关生成后固定进 platform_job.payload。"""
+
+    model_config = {"protected_namespaces": ()}  # 允许 model_name 字段名
+
+    model_name: str
+    dataset_version: str
+    dataset_name: str | None = None
+    params: dict = Field(default_factory=dict, description='如 {"epochs": 8, "alpha": 0.001}')
+    seed: int | None = None
+    requested_by: str | None = None
+
+
+class TrainJobOut(BaseModel):
+    job_id: str
+    job_type: str = "training"
+    status: str
+    payload: dict = Field(default_factory=dict)
+    result: dict = Field(default_factory=dict)
+    error_code: str | None = None
+    error: str | None = None
+
+
+class PromoteRequestIn(BaseModel):
+    to_stage: str = Field(description="production / staging 等，写成 MLflow alias")
+    actor: str
+    reason: str | None = None
+    from_stage: str | None = None

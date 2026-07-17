@@ -1,0 +1,74 @@
+# Argo Workflows 叠加配置（README 3.6.3）。基础安装来自官方 namespace 级清单
+# deploy/k8s/argo/namespace-install-v4.0.7.yaml（CRD + workflow-controller +
+# argo-server，只监管 data 命名空间）；本文件叠加三样 EDP 专属配置：
+#   1. artifact repository → MinIO：archiveLogs 让每个 worker pod 的 stdout
+#      自动归档到 s3://lake/argo/，pod 删除后日志仍可在 Argo UI 逐节点查看；
+#   2. workflowDefaults：完结 1 天后自动删 Workflow CR（对应 retention 语义），
+#      pod 完结即删（现场靠归档日志 + staging manifest，不靠 pod 留存）；
+#   3. RBAC：dagster SA 允许提交/查询 Workflow（run pod 是提交方），同时
+#      workflow pod 以 dagster SA 运行，argoexec sidecar 需要写 workflowtaskresults。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argo-minio-cred
+  namespace: data
+type: Opaque
+stringData:
+  accesskey: minioadmin
+  secretkey: minioadmin123
+---
+# 覆盖 namespace-install 里的空 configmap（apply.sh 里本文件在其之后 apply）
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workflow-controller-configmap
+  namespace: data
+data:
+  artifactRepository: |
+    archiveLogs: true
+    s3:
+      endpoint: minio:9000
+      insecure: true
+      bucket: lake
+      keyFormat: "argo/{{workflow.name}}/{{pod.name}}"
+      accessKeySecret:
+        name: argo-minio-cred
+        key: accesskey
+      secretKeySecret:
+        name: argo-minio-cred
+        key: secretkey
+  workflowDefaults: |
+    spec:
+      ttlStrategy:
+        secondsAfterCompletion: 86400
+      podGC:
+        strategy: OnPodCompletion
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: edp-argo-submit
+  namespace: data
+rules:
+  # run pod（dagster SA）提交/轮询/终止 Workflow CR
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch"]
+  # workflow pod 也以 dagster SA 运行：argoexec 上报节点结果需要
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflowtaskresults"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: edp-argo-submit
+  namespace: data
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: edp-argo-submit
+subjects:
+  - kind: ServiceAccount
+    name: dagster
+    namespace: data

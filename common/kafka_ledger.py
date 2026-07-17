@@ -55,3 +55,17 @@ def emit_ingest_request(upload_id: str, manifest_op: str) -> None:
         payload={"upload_id": upload_id, "manifest_op": manifest_op},
         topic=settings.kafka_ingest_topic,
     )
+
+
+def emit_job_request(job_id: str, job_type: str) -> None:
+    """发一条通用任务触发事件（README 3.7.4），由对应类型的 kafka sensor 消费。
+
+    同样尽力而为：platform_job 已是 ready，消息丢了由 watchdog 的
+    "ready 悬置修复"补发。
+    """
+    emit(
+        "job.requested",
+        key=job_id,
+        payload={"job_id": job_id, "job_type": job_type},
+        topic=settings.kafka_jobs_topic,
+    )

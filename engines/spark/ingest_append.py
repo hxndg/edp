@@ -7,8 +7,8 @@ pod fan-out 形态（README 3.6.3，讲解见 docs/pod-fanout-guide.md）：run 
     ────────────────────────────────       ─────────────────────────────
     claim_many（saga 互斥）
     写 input.json 到 staging  ──────────▶  下载 MCAP → 流式解析/清洗/切片
-    Pipes 分波起 pod（日志流回本 run）        → 写 Lance → 厚表分块写 staging parquet
-    收 manifest.json（缺失→查 pod 终态定码）◀─  薄表行 + error_code 内联在 manifest 里
+    提交 Argo Workflow（并发/超时归它管）      → 写 Lance → 厚表分块写 staging parquet
+    收 manifest.json（缺失→查节点终态定码）◀─  薄表行 + error_code 内联在 manifest 里
     合并全批行，每表每批一次 Iceberg commit
     succeed_many + session done
 
@@ -34,7 +34,7 @@ from common.iceberg import in_filter, replace_where_chunked, upsert
 from common.runtime_config import get_int, get_str
 from common.saga import SagaBatch
 from common.strategy_registry import resolve
-from common.worker_pods import WorkerSpec, launch_wave
+from common.argo_workflows import WorkerSpec, launch_wave
 from engines.worker import staging
 from schemas.iceberg_tables import (
     BRONZE_IMU,
@@ -60,7 +60,7 @@ THIN_TABLE_KEYS = {
 
 def run_batch(upload_ids: list[str], op_context) -> dict:
     """批量 Saga 外壳（README 3.6.3）。op_context 是 Dagster 的执行上下文：
-    run_id 从它取，Pipes 客户端用它把 worker 日志流回本 run。"""
+    run_id 从它取（worker 日志由 Argo 归档到 s3://lake/argo/）。"""
     run_id = op_context.run_id
     sessions = {
         row["upload_id"]: row

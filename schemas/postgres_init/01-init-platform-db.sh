@@ -13,3 +13,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
 echo "[init] applying platform DDL"
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_PLATFORM_DB" \
   -f /docker-entrypoint-initdb.d/postgres_platform.sql
+
+# MLflow backend store（README 3.7）：只建库，表由 mlflow server 首次启动时自建
+echo "[init] creating database 'mlflow' owned by ${POSTGRES_USER}"
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+  -c "CREATE DATABASE mlflow OWNER ${POSTGRES_USER};"
+
+# Iceberg REST catalog 的元数据库：不持久化的话 pod 重启会丢掉全部表注册信息
+echo "[init] creating database 'iceberg_catalog' owned by ${POSTGRES_USER}"
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+  -c "CREATE DATABASE iceberg_catalog OWNER ${POSTGRES_USER};"

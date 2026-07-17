@@ -39,3 +39,25 @@ def dataset_quality_gate(context) -> AssetCheckResult:
         metadata={"num_samples": num_samples_val, "mean_quality_score": mean_quality_val},
         description=f"num_samples={num_samples_val} mean_quality_score={mean_quality_val}",
     )
+
+
+@asset_check(
+    asset=AssetKey("model_training"),
+    description="训练质量门（README 3.7.3）：val_accuracy >= TRAIN_GATE_MIN_ACCURACY。不挡归档（训得差也是要记录的事实），挡 promote 的手",
+)
+def training_quality_gate(context) -> AssetCheckResult:
+    from common.runtime_config import get_float
+
+    materialization = context.instance.get_latest_materialization_event(AssetKey("model_training"))
+    if materialization is None or materialization.asset_materialization is None:
+        return AssetCheckResult(passed=False, description="model_training 还没有任何物化记录")
+
+    metadata = materialization.asset_materialization.metadata
+    val_accuracy = metadata.get("val_accuracy")
+    val_accuracy_val = float(val_accuracy.value) if val_accuracy else 0.0
+    threshold = get_float("TRAIN_GATE_MIN_ACCURACY", 0.6)
+    return AssetCheckResult(
+        passed=val_accuracy_val >= threshold,
+        metadata={"val_accuracy": val_accuracy_val, "threshold": threshold},
+        description=f"val_accuracy={val_accuracy_val} threshold={threshold}",
+    )

@@ -34,11 +34,23 @@ kubectl -n "$NS" create configmap dagster-workspace \
 # 20-apps：dagster 三件套 + gateway
 kubectl apply -f deploy/k8s/10-infra.yaml -f deploy/k8s/20-apps.yaml
 
+# Argo Workflows：官方 namespace 级安装 + EDP 叠加（30-argo.yaml 必须在其后，
+# 覆盖空的 workflow-controller-configmap）。镜像需预载：
+#   quay.io/argoproj/{workflow-controller,argocli,argoexec}:v4.0.7
+kubectl -n "$NS" apply --server-side -f deploy/k8s/argo/namespace-install-v4.0.7.yaml
+kubectl apply -f deploy/k8s/30-argo.yaml
+# dev 环境免登录访问 Argo UI（生产应保留默认 client 认证）
+kubectl -n "$NS" patch deploy argo-server --type=json -p \
+  '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--auth-mode=server"}]' \
+  >/dev/null 2>&1 || true
+
 echo
 echo "等待就绪：kubectl -n $NS get pods -w"
 echo "Dagster UI：kubectl -n $NS port-forward svc/dagster-webserver 3000:3000"
 echo "Gateway   ：kubectl -n $NS port-forward svc/gateway 8000:8000"
 echo "Tag 检索界面（OpenSearch Dashboards）：kubectl -n $NS port-forward svc/opensearch-dashboards 5601:5601"
+echo "MLflow UI ：kubectl -n $NS port-forward svc/mlflow 5000:5000"
+echo "Argo UI   ：kubectl -n $NS port-forward svc/argo-server 2746:2746   （https，浏览器接受自签证书）"
 echo "首次部署记得建 Iceberg 表："
 echo "  kubectl -n $NS run init-iceberg --rm -it --restart=Never --image=edp:dev \\"
 echo "    --overrides='{\"spec\":{\"containers\":[{\"name\":\"init-iceberg\",\"image\":\"edp:dev\",\"command\":[\"python\",\"-m\",\"schemas.iceberg_tables\"],\"envFrom\":[{\"configMapRef\":{\"name\":\"edp-env\"}}]}]}}'"

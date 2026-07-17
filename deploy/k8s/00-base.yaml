@@ -22,11 +22,14 @@ data:
   KAFKA_BOOTSTRAP: kafka:9092
   KAFKA_TOPIC: edp.events
   KAFKA_INGEST_TOPIC: edp.ingest.requests
+  KAFKA_JOBS_TOPIC: edp.jobs.requests
   MINIO_ENDPOINT: http://minio:9000
   MINIO_ROOT_USER: minioadmin
   MINIO_ROOT_PASSWORD: minioadmin123
   MINIO_BUCKET: lake
   OPENSEARCH_URL: http://opensearch:9200
+  # MLflow 操作台（README 3.7）：训练 worker best-effort 打点，gateway promote 设 alias
+  MLFLOW_TRACKING_URI: http://mlflow:5000
   ICEBERG_REST_URI: http://iceberg-rest:8181
   ICEBERG_WAREHOUSE: s3://lake/warehouse
   ICEBERG_CATALOG_NAME: edp

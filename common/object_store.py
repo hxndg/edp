@@ -21,6 +21,7 @@ PREFIX_GOLD = "gold"
 PREFIX_DATASET = "dataset"
 PREFIX_ARTIFACT = "artifact"
 PREFIX_QUARANTINE = "quarantine"
+PREFIX_MODELS = "models"  # 训练产出的权重文件（README 3.7：模型权重的 SoT 位置）
 PREFIX_ANNOTATION_PKG = "annotation_packages"
 
 

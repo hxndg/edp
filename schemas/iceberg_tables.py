@@ -42,10 +42,13 @@ TAG_DEF = "tag_def"
 DATASET = "dataset"
 DATASET_SAMPLE = "dataset_sample"
 DATASET_EXPORT = "dataset_export"
-TRAIN_RUN = "train_run"
-EVAL_RUN = "eval_run"
-MODEL_ARTIFACT = "model_artifact"
 ANALYTICS_SUMMARY = "analytics_summary"
+# ML 域（README 3.7）：训练档案 / 曲线底账 / 版本登记 / promote 账本 / 评测明细
+ML_TRAINING_RUN = "ml_training_run"
+ML_METRIC_EPOCH = "ml_metric_epoch"
+ML_MODEL_VERSION = "ml_model_version"
+ML_PROMOTION_EVENT = "ml_promotion_event"
+ML_EVAL_SAMPLE = "ml_eval_sample"
 
 
 class _SchemaBuilder:
@@ -325,32 +328,93 @@ def dataset_export_schema() -> Schema:
     )
 
 
-def train_run_schema() -> Schema:
+# ---------------------------------------------------------------------------
+# README 3.7 ML 域表：MLflow 是操作台，这五张表才是模型域记录的 SoT
+# ---------------------------------------------------------------------------
+
+def ml_training_run_schema() -> Schema:
+    """训练档案：一次训练一行，job_id 与 PG platform_job 对齐。
+    dataset_version + image + params_json + seed 四元组 = 完整复现配方。"""
     return (
         _SchemaBuilder()
-        .field("run_id", StringType(), required=True)
+        .field("job_id", StringType(), required=True)
+        .field("model_name", StringType())
+        .field("dataset_name", StringType())
         .field("dataset_version", StringType())
-        .field("code_ver", StringType())
+        .field("mlflow_run_id", StringType())      # 到 MLflow UI 的跳转键，可为空
+        .field("mlflow_experiment", StringType())
+        .field("image", StringType())              # 训练执行镜像（代码版本）
         .field("params_json", StringType())
-        .field("metrics_json", StringType())
-        .field("state", StringType())
+        .field("seed", LongType())
+        .field("metrics_json", StringType())       # 终局指标
+        .field("artifact_uri", StringType())
+        .field("artifact_sha256", StringType())
+        .field("num_train", LongType())
+        .field("num_val", LongType())
+        .field("status", StringType())             # SUCCEEDED / FAILED
+        .field("trained_at", TimestampType())
         .with_audit_columns()
         .build()
     )
 
 
-def eval_run_schema() -> Schema:
-    return train_run_schema()
-
-
-def model_artifact_schema() -> Schema:
+def ml_metric_epoch_schema() -> Schema:
     return (
         _SchemaBuilder()
-        .field("model_id", StringType(), required=True)
-        .field("run_id", StringType())
+        .field("job_id", StringType(), required=True)
+        .field("metric_name", StringType(), required=True)
+        .field("epoch", LongType(), required=True)
+        .field("value", DoubleType())
+        .field("mlflow_run_id", StringType())
+        .with_audit_columns()
+        .build()
+    )
+
+
+def ml_model_version_schema() -> Schema:
+    return (
+        _SchemaBuilder()
+        .field("model_name", StringType(), required=True)
+        .field("version", StringType(), required=True)   # = job_id，每次成功训练一个不可变版本
+        .field("mlflow_version", StringType())           # MLflow Registry 侧的版本号，可为空
+        .field("job_id", StringType())
         .field("dataset_version", StringType())
-        .field("format", StringType())
         .field("artifact_uri", StringType())
+        .field("artifact_sha256", StringType())
+        .field("registered_at", TimestampType())
+        .with_audit_columns()
+        .build()
+    )
+
+
+def ml_promotion_event_schema() -> Schema:
+    return (
+        _SchemaBuilder()
+        .field("event_id", StringType(), required=True)
+        .field("model_name", StringType())
+        .field("version", StringType())
+        .field("from_stage", StringType())
+        .field("to_stage", StringType())
+        .field("actor", StringType())
+        .field("reason", StringType())
+        .field("occurred_at", TimestampType())
+        .with_audit_columns()
+        .build()
+    )
+
+
+def ml_eval_sample_schema() -> Schema:
+    return (
+        _SchemaBuilder()
+        .field("job_id", StringType(), required=True)
+        .field("sample_id", StringType(), required=True)
+        .field("model_name", StringType())
+        .field("dataset_version", StringType())
+        .field("split", StringType())
+        .field("y_true", LongType())
+        .field("y_pred", LongType())
+        .field("prob", DoubleType())
+        .field("correct", BooleanType())
         .with_audit_columns()
         .build()
     )
@@ -387,10 +451,12 @@ _TABLE_DEFS: dict[str, tuple] = {
     DATASET: (dataset_schema, None),
     DATASET_SAMPLE: (dataset_sample_schema, None),
     DATASET_EXPORT: (dataset_export_schema, None),
-    TRAIN_RUN: (train_run_schema, None),
-    EVAL_RUN: (eval_run_schema, None),
-    MODEL_ARTIFACT: (model_artifact_schema, None),
     ANALYTICS_SUMMARY: (analytics_summary_schema, None),
+    ML_TRAINING_RUN: (ml_training_run_schema, None),
+    ML_METRIC_EPOCH: (ml_metric_epoch_schema, None),
+    ML_MODEL_VERSION: (ml_model_version_schema, None),
+    ML_PROMOTION_EVENT: (ml_promotion_event_schema, None),
+    ML_EVAL_SAMPLE: (ml_eval_sample_schema, None),
 }
 
 ALL_TABLES = list(_TABLE_DEFS.keys())

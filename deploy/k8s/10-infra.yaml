@@ -269,6 +269,73 @@ spec:
     - port: 5601
       targetPort: 5601
 ---
+# MLflow（README 3.7）：实验记录 + Model Registry 的操作台，不是 SoT。
+# 复用 edp:dev 镜像（mlflow 在 pyproject 依赖里）；backend 用 PG 独立的 mlflow 库，
+# artifact 经 server 代理（--serve-artifacts）写 MinIO s3://lake/mlflow——
+# worker 打点时不需要任何 S3 凭证。挂了只丢过程观测，训练照常（best-effort）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mlflow }
+  template:
+    metadata:
+      labels: { app: mlflow }
+    spec:
+      initContainers:
+        # 幂等建库：postgres 卷已初始化过的老部署不会重跑 init 脚本，这里补建
+        - name: ensure-db
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PGPASSWORD, value: edp123 }
+          command:
+            - bash
+            - -c
+            - |
+              until pg_isready -h postgres -U edp -d postgres; do sleep 2; done
+              psql -h postgres -U edp -d dagster -tc "SELECT 1 FROM pg_database WHERE datname='mlflow'" | grep -q 1 \
+                || psql -h postgres -U edp -d dagster -c "CREATE DATABASE mlflow OWNER edp"
+      containers:
+        - name: mlflow
+          image: edp:dev
+          imagePullPolicy: IfNotPresent
+          command:
+            - mlflow
+            - server
+            - --host=0.0.0.0
+            - --port=5000
+            # 必须走 psycopg2（镜像里装了 psycopg2-binary）：MLflow 的 SQLAlchemy
+            # 查询在 psycopg3 方言下会触发 "integer = character varying" 类型错误
+            - --backend-store-uri=postgresql+psycopg2://edp:edp123@postgres:5432/mlflow
+            - --artifacts-destination=s3://lake/mlflow
+            - --serve-artifacts
+          env:
+            - { name: MLFLOW_S3_ENDPOINT_URL, value: "http://minio:9000" }
+            - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
+            - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin123 }
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet: { path: /health, port: 5000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: data
+spec:
+  selector: { app: mlflow }
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -282,6 +349,20 @@ spec:
     metadata:
       labels: { app: iceberg-rest }
     spec:
+      initContainers:
+        # 幂等建库（与 mlflow 的 ensure-db 同理）：老部署的 postgres 卷不会重跑 init 脚本
+        - name: ensure-db
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PGPASSWORD, value: edp123 }
+          command:
+            - bash
+            - -c
+            - |
+              until pg_isready -h postgres -U edp -d postgres; do sleep 2; done
+              psql -h postgres -U edp -d dagster -tc "SELECT 1 FROM pg_database WHERE datname='iceberg_catalog'" | grep -q 1 \
+                || psql -h postgres -U edp -d dagster -c "CREATE DATABASE iceberg_catalog OWNER edp"
       containers:
         - name: iceberg-rest
           image: tabulario/iceberg-rest:1.6.0
@@ -294,6 +375,13 @@ spec:
             - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
             - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin123 }
             - { name: AWS_REGION, value: us-east-1 }
+            # catalog 元数据必须持久化：镜像默认是进程内 SQLite（mode=memory），
+            # pod 一重启所有表的注册信息全丢（数据文件还在 MinIO，但 catalog
+            # 不再认识它们）。这里落到 postgres 的 iceberg_catalog 库。
+            - { name: CATALOG_CATALOG__IMPL, value: "org.apache.iceberg.jdbc.JdbcCatalog" }
+            - { name: CATALOG_URI, value: "jdbc:postgresql://postgres:5432/iceberg_catalog" }
+            - { name: CATALOG_JDBC_USER, value: edp }
+            - { name: CATALOG_JDBC_PASSWORD, value: edp123 }
           ports:
             - containerPort: 8181
 ---

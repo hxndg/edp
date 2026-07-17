@@ -40,8 +40,8 @@ def ingest_multi_asset(context: AssetExecutionContext, config: IngestBatchConfig
     else:
         from engines.spark.ingest_correct import run_batch
 
-    # context 传给引擎：run_id 从它取；worker pod 用 Pipes 拉起时，日志/消息
-    # 也通过它流回本 run 的 compute log（common/worker_pods.py）
+    # context 传给引擎：run_id 从它取（worker 由 Argo Workflow 监管，
+    # 日志归档在 s3://lake/argo/，见 common/argo_workflows.py）
     result = run_batch(config.upload_ids, context)
     per_upload = result["per_upload"]
 

@@ -1,7 +1,8 @@
 """解析 worker 的入口（README 3.6.3 pod fan-out）：一个 pod 处理一个 upload。
 
-被 run pod 用 PipesK8sClient 拉起（engines/spark/ingest_append.py::_fan_out_parse），
-干批内最重的活：下载 MCAP → 流式解析 → 清洗 → 切片 → 写 Lance → 待写行落 staging。
+由 run pod 提交的 Argo Workflow 拉起（engines/spark/ingest_append.py::_fan_out_parse
+→ common/argo_workflows.py），干批内最重的活：下载 MCAP → 流式解析 → 清洗 →
+切片 → 写 Lance → 待写行落 staging。stdout 由 Argo 归档到 s3://lake/argo/。
 
 职责边界（与 run pod 的契约见 engines/worker/staging.py）：
 - 只读 input.json（run pod 预先写好：session 快照、清洗策略入口、correct 的
@@ -10,8 +11,8 @@
   （common/errors.py 的状态码），由 run pod 对该 upload 做 saga fail_one；
   只有 pod 级失败（OOM/超时）才表现为"没有清单"——死掉的进程自报不了，
   由 run pod 查 pod 终态推断码；
-- Dagster Pipes 是**观测通道**（日志流回 run 的 compute log、完成时上报小结），
-  数据契约仍以 staging 的 manifest.json 为准——不受日志行长度限制影响。
+- 数据契约以 staging 的 manifest.json 为准；若在 Dagster Pipes 环境下拉起
+  （检测 bootstrap 环境变量）也能把日志流回 run，Argo 形态下退化为普通进程。
 
 内存模型（固定预算，与文件大小解耦）：
 - 原始文件下载到本地盘（不整块进内存），MCAP 从文件句柄流式迭代；
@@ -472,8 +473,8 @@ def _run(inp: dict, prefix: str, workdir: str) -> dict:
 
 
 def _maybe_open_pipes():
-    """在 PipesK8sClient 拉起的 pod 里打开 pipes 会话（日志/消息流回 Dagster run）；
-    本地手工运行（无 bootstrap 环境变量）时退化为普通进程，功能不受影响。"""
+    """若由 Dagster Pipes 拉起（有 bootstrap 环境变量）则打开 pipes 会话；
+    Argo/本地手工运行时退化为普通进程，功能不受影响。"""
     from dagster_pipes import DAGSTER_PIPES_CONTEXT_ENV_VAR
 
     if os.environ.get(DAGSTER_PIPES_CONTEXT_ENV_VAR):

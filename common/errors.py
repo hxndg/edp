@@ -1,13 +1,12 @@
 """状态码体系（docs/pod-fanout-guide.md 第四节）：worker/run 失败的统一分类。
 
-状态码与传输解耦——Pipes 只是把 worker 自报的那部分带回来的通道，码本身
-有三个来源，各自的产生方式不同：
+状态码与传输解耦——码本身有三个来源，各自的产生方式不同：
 
 1. **worker 自报**（业务失败，进程活着能说清楚）：worker 把 code + message
-   写进 staging 的 manifest.json（契约真相），同时通过 Pipes 消息上报给 UI。
-2. **run 侧从 pod 状态推断**（pod 级失败，进程死了不可能自报）：OOMKill 是
-   内核直接杀进程、超时是 kubelet 杀 pod，Pipes 通道一起死；run pod 事后查
-   pod 终态（terminated.reason / DeadlineExceeded）分类。
+   写进 staging 的 manifest.json（契约真相）。
+2. **run 侧从 pod 终态推断**（pod 级失败，进程死了不可能自报）：OOMKill 是
+   内核直接杀进程、超时是 kubelet 杀 pod；run pod 事后从 Argo 节点终态
+   （message 里的 OOMKilled / deadline）分类，见 common/argo_workflows.py。
 3. **run 侧自身错误**（commit 冲突、PG 挂了）：不经过 worker。
 
 每个码带**可重试性**标记，重试层（stuck sensor / gateway retry）按它决定：

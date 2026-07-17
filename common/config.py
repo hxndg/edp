@@ -45,6 +45,8 @@ class Settings:
     # ingest 触发专用 topic（区别于 kafka_topic 账本）：gateway 提交 manifest 后
     # 发一条 ingest.requested，Dagster 的 kafka sensor 消费它拉起 run
     kafka_ingest_topic: str = field(default_factory=lambda: _env("KAFKA_INGEST_TOPIC", "edp.ingest.requests"))
+    # 通用任务触发 topic（README 3.7.4）：platform_job（training 等）走这条
+    kafka_jobs_topic: str = field(default_factory=lambda: _env("KAFKA_JOBS_TOPIC", "edp.jobs.requests"))
 
     # Iceberg REST catalog
     iceberg_rest_uri: str = field(default_factory=lambda: _env("ICEBERG_REST_URI", "http://localhost:8181"))
@@ -53,6 +55,9 @@ class Settings:
 
     # OpenSearch（tag 检索投影，README 3.5；SoT 在 Iceberg，索引可整体重建）
     opensearch_url: str = field(default_factory=lambda: _env("OPENSEARCH_URL", "http://localhost:9200"))
+
+    # MLflow（README 3.7：实验记录 + Model Registry 操作台，不是 SoT）
+    mlflow_tracking_uri: str = field(default_factory=lambda: _env("MLFLOW_TRACKING_URI", "http://localhost:5000"))
 
     # Gateway / Dagster
     gateway_host: str = field(default_factory=lambda: _env("GATEWAY_HOST", "0.0.0.0"))

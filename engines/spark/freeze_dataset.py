@@ -75,6 +75,32 @@ def _assign_split(sample_ids: list[str], split: dict) -> dict[str, str]:
     return {sid: rng.choices(names, weights=weights)[0] for sid in sorted(sample_ids)}
 
 
+def _manual_candidates(sample_ids: list[str]) -> tuple[list[str], dict]:
+    """手工挑样本路径（README 3.7.2）：跳过 Spark 条件圈选，只校验样本存在。
+
+    质量门有意不做——用户点名要这些样本，说明人已经做过判断；训练侧仍然只认
+    冻出来的 dataset_version，可复现性不受影响。不存在的 id 直接报错而不是
+    静默剔除：静默剔除会让"冻出来的数据集"和"用户以为的数据集"不一致。
+    """
+    from common.iceberg import in_filter, load_table
+
+    found = {
+        r["sample_id"]: float(r["quality_score"] or 0.0)
+        for r in load_table("sample")
+        .scan(row_filter=in_filter("sample_id", sample_ids), selected_fields=("sample_id", "quality_score"))
+        .to_arrow()
+        .to_pylist()
+    }
+    missing = sorted(set(sample_ids) - set(found))
+    if missing:
+        raise FreezeGateError(
+            f"手工清单里有 {len(missing)} 个 sample 不存在：{missing[:5]}...",
+            {"num_samples": len(found), "missing": len(missing)},
+        )
+    mean_quality = sum(found.values()) / len(found) if found else 0.0
+    return list(found), {"num_samples": len(found), "mean_quality_score": mean_quality, "selection": "manual"}
+
+
 def run(
     *,
     request_id: str,
@@ -83,14 +109,16 @@ def run(
     quality_threshold: float,
     split: dict,
     run_id: str,
+    sample_ids: list[str] | None = None,
 ) -> dict:
-    spark = build_spark_session("freeze_dataset")
-    candidates = compute_candidates(spark, filter_expr, quality_threshold)
-    candidates_pdf = candidates.select("sample_id", "quality_score").toPandas()
-
-    stats = _quality_gate(candidates_pdf, quality_threshold)
-
-    sample_ids = candidates_pdf["sample_id"].tolist()
+    if sample_ids:
+        sample_ids, stats = _manual_candidates(sample_ids)
+    else:
+        spark = build_spark_session("freeze_dataset")
+        candidates = compute_candidates(spark, filter_expr, quality_threshold)
+        candidates_pdf = candidates.select("sample_id", "quality_score").toPandas()
+        stats = _quality_gate(candidates_pdf, quality_threshold)
+        sample_ids = candidates_pdf["sample_id"].tolist()
     dataset_version = f"v{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
     manifest_hash = hashlib.sha256(",".join(sorted(sample_ids)).encode()).hexdigest()[:16]
     splits = _assign_split(sample_ids, split)

@@ -29,6 +29,22 @@ CREATE TABLE IF NOT EXISTS ingest_job (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 通用异步任务状态机（README 3.1.2.1 / 3.7.4）：job_type 区分类型（MVP 只有
+-- training），payload/result JSONB 装类型专属字段，协议层（common/jobs.py）不解释。
+-- upload_session 是同一协议的历史绑定，表结构保持不动；未来新任务类型统一落这张表。
+CREATE TABLE IF NOT EXISTS platform_job (
+    job_id              TEXT PRIMARY KEY,
+    job_type            TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'ready'
+                        CHECK (status IN ('ready', 'running', 'done', 'failed')),
+    payload             JSONB NOT NULL DEFAULT '{}',
+    result              JSONB NOT NULL DEFAULT '{}',
+    requested_by        TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_platform_job_type_status ON platform_job (job_type, status);
+
 CREATE TABLE IF NOT EXISTS annotation_batch (
     batch_id            TEXT PRIMARY KEY,
     upload_id           TEXT REFERENCES upload_session(upload_id),
@@ -107,7 +123,12 @@ INSERT INTO runtime_config (key, value, description) VALUES
     ('INGEST_WORKER_MEMORY_TIERS', '1Gi,2Gi,4Gi', 'worker 内存 limit 按 saga attempt 升档（OOM 自动重试时用更高档）'),
     ('INGEST_WORKER_CHUNK_ROWS', '50000', 'worker 流式解析的分块行数（bronze/silver 每 N 行 flush 一个 row group）'),
     ('INGEST_RETRY_BACKOFF_MINUTES', '5', 'failed 会话按 error_code 自动重试前的退避分钟数（stuck sensor）'),
-    ('STAGING_RETENTION_DAYS', '7', 'MinIO staging/ 交接区残留文件的保留天数（README 3.6.3，retention job 按 mtime 清）')
+    ('STAGING_RETENTION_DAYS', '7', 'MinIO staging/ 交接区残留文件的保留天数（README 3.6.3，retention job 按 mtime 清）'),
+    ('TRAIN_MAX_INFLIGHT', '2', '同时在跑（排队+执行中）的训练 run 上限（README 3.7.2 背压）'),
+    ('TRAIN_WORKER_TIMEOUT_SECONDS', '1800', '单个训练 worker pod 的硬超时（activeDeadlineSeconds，训练比解析长）'),
+    ('TRAIN_WORKER_MEMORY_TIERS', '1Gi,2Gi,4Gi', '训练 worker 内存 limit 按 saga attempt 升档（OOM 自动重试时用更高档）'),
+    ('TRAIN_RETRY_BACKOFF_MINUTES', '5', 'failed 训练任务按 error_code 自动重试前的退避分钟数（watchdog）'),
+    ('TRAIN_GATE_MIN_ACCURACY', '0.6', 'training_quality_gate asset check 的 val_accuracy 门槛（不挡归档，挡 promote 的手）')
 ON CONFLICT (key) DO NOTHING;
 
 -- 策略注册表（README 3.1.2.2）：每个处理阶段实际执行哪个策略由这张表在运行时解析。

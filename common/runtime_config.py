@@ -39,6 +39,12 @@ DEFAULTS: dict[str, str] = {
     "INGEST_RETRY_BACKOFF_MINUTES": "5",
     # staging 交接区（run↔worker）残留文件的保留天数，retention job 按 mtime 清
     "STAGING_RETENTION_DAYS": "7",
+    # 训练（README 3.7）：背压 / worker 超时与内存档 / 重试退避 / 质量门
+    "TRAIN_MAX_INFLIGHT": "2",
+    "TRAIN_WORKER_TIMEOUT_SECONDS": "1800",
+    "TRAIN_WORKER_MEMORY_TIERS": "1Gi,2Gi,4Gi",
+    "TRAIN_RETRY_BACKOFF_MINUTES": "5",
+    "TRAIN_GATE_MIN_ACCURACY": "0.6",
 }
 
 _ddl_lock = threading.Lock()
@@ -70,5 +76,13 @@ def get_int(key: str, default: int) -> int:
     raw = get_str(key, str(default))
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def get_float(key: str, default: float) -> float:
+    raw = get_str(key, str(default))
+    try:
+        return float(raw)
     except ValueError:
         return default

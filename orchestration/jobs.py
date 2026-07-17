@@ -49,10 +49,10 @@ freeze_dataset_job = define_asset_job(
     description="README 3.2.3：建数据集请求触发的冻结 + 导出",
 )
 
-mock_train_job = define_asset_job(
-    name="mock_train_job",
-    selection=["train_run", "model_artifact"],
-    description="README 3.2.4：科研人员直接调 API 触发的 mock 训练",
+model_training_job = define_asset_job(
+    name="model_training_job",
+    selection=["model_training"],
+    description="README 3.7：gateway POST /train 发起、training_kafka_sensor 拉起的模型训练（run_config 传 job_id）",
 )
 
 analytics_job = define_asset_job(

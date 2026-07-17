@@ -1,5 +1,11 @@
 # Pipes Fan-out 改造：逐行代码审核文档
 
+> **2026-07-17 更新**：pod 的拉起/监督已从本文讲的 `common/worker_pods.py`
+> （PipesK8sClient）切换为 Argo Workflows（`common/argo_workflows.py`），
+> 新实现的逐行讲解见 `docs/argo-workflows-code-review.md`。本文中
+> **saga、错误码、staging 契约、worker 内部逻辑、Iceberg commit** 的章节仍然有效
+> （那些代码没改）；仅"launch_wave / 监视线程 / Pipes 会话"相关小节已过时。
+
 本文面向代码审核，按**一个批次的执行顺序**把这次改造涉及的每个文件、每段代码讲清楚。
 配套阅读：`docs/pod-fanout-guide.md`（架构讲解）、README 3.6.3（设计定位）。
 

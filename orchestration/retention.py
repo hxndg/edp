@@ -79,6 +79,16 @@ def purge_expired_records(context) -> dict:
         """,
         (cutoff,),
     )
+    # 通用状态机的终态任务行（training 等，README 3.7.4）：档案在 Iceberg ml_* 表
+    from common.jobs import _ensure_table as _ensure_platform_job
+
+    _ensure_platform_job()  # 老部署（不重跑 init 脚本）第一次清理前先幂等建表
+    deleted_jobs = len(
+        fetch_all(
+            "DELETE FROM platform_job WHERE status IN ('done', 'failed') AND updated_at < %s RETURNING job_id",
+            (cutoff,),
+        )
+    )
     # 还被 annotation_batch 引用的 session（LABELING 中的批次）不删，等批次 DONE 过期后一起走
     deleted_sessions = len(
         fetch_all(
@@ -108,6 +118,7 @@ def purge_expired_records(context) -> dict:
         "deleted_saga_logs": deleted_sagas,
         "deleted_annotation_batches": deleted_batches,
         "deleted_upload_sessions": deleted_sessions,
+        "deleted_platform_jobs": deleted_jobs,
         "deleted_staging_objects": deleted_staging,
     }
     context.log.info("retention 清理完成：%s", summary)

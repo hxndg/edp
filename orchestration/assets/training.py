@@ -1,28 +1,43 @@
-"""训练/评测消费（mock，README 3.2.4）：科研人员直接调 Dagster API/Launchpad
-触发，不经过网关——网关只转发"建数据集"和"标注完成"这两类事件（README 2.3）。
+"""模型训练 asset（README 3.2.4 / 3.7）：模型也是 asset，dep 指向 `dataset`——
+血缘图上"数据 → 模型"的那条边。触发走 gateway `POST /train` → platform_job →
+`training_kafka_sensor`（orchestration/sensors.py），一个 job 一个 run。
 """
 
-from dagster import AssetExecutionContext, AssetKey, AssetOut, Config, Output, multi_asset
+from dagster import AssetExecutionContext, Config, MetadataValue, Output, asset
 
 
-class MockTrainConfig(Config):
-    dataset_version: str
-    params: dict = {}
+class TrainingJobConfig(Config):
+    """sensor 从 platform_job 取到的任务号；训练输入（模型名/数据集/超参/seed）
+    都在 platform_job.payload 里——run_config 只传引用，保证 UI Re-execute 时
+    以 PG 状态为起点，不携带可能过期的参数副本。"""
+
+    job_id: str
 
 
-@multi_asset(
-    name="mock_train",
+@asset(
+    name="model_training",
     group_name="training",
-    deps=[AssetKey("dataset_export")],
-    outs={
-        "train_run": AssetOut(description="mock 训练任务记录"),
-        "model_artifact": AssetOut(description="产物元数据"),
-    },
-    description="mock 训练：读导出包、跑几秒、验证消费侧接口契约（README 2.4：Ray mock）",
+    deps=["dataset"],
+    description="训练 worker pod（Argo Workflow）+ MLflow 打点 + Iceberg 四表归档（README 3.7）",
 )
-def mock_train_assets(context: AssetExecutionContext, config: MockTrainConfig):
-    from engines.ray.mock_train import run as train_run
+def model_training(context: AssetExecutionContext, config: TrainingJobConfig) -> Output[dict]:
+    from engines.training.run_job import run_training
 
-    result = train_run(config.dataset_version, config.params, run_id=context.run_id)
-    yield Output(value=result["train_run_id"], output_name="train_run", metadata=result["metrics"])
-    yield Output(value=result["model_id"], output_name="model_artifact", metadata={"model_id": result["model_id"]})
+    result = run_training(config.job_id, context)
+    metadata = {
+        "job_id": config.job_id,
+        "status": result["status"],
+    }
+    if result["status"] == "done":
+        metadata.update(
+            {
+                "model_name": result["model_name"],
+                "model_version": result["model_version"],
+                "dataset_version": result["dataset_version"],
+                "mlflow_run_id": result.get("mlflow_run_id") or "(mlflow 不可用)",
+                "artifact_uri": result["artifact_uri"],
+                "metrics": MetadataValue.json(result["metrics"]),
+                "val_accuracy": float(result["metrics"].get("val_accuracy") or 0.0),
+            }
+        )
+    return Output(value=result, metadata=metadata)

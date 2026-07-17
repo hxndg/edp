@@ -11,8 +11,8 @@ from orchestration.assets.annotation import annotation_collect, annotation_route
 from orchestration.assets.dataset import dataset_asset, dataset_export_asset
 from orchestration.assets.ingest import ingest_multi_asset
 from orchestration.assets.tagging import entity_tag, entity_tag_index
-from orchestration.assets.training import mock_train_assets
-from orchestration.checks import dataset_quality_gate, freshness_checks
+from orchestration.assets.training import model_training
+from orchestration.checks import dataset_quality_gate, freshness_checks, training_quality_gate
 from orchestration.compaction import compaction_job
 from orchestration.jobs import (
     analytics_job,
@@ -20,7 +20,7 @@ from orchestration.jobs import (
     freeze_dataset_job,
     ingest_append_job,
     ingest_correct_job,
-    mock_train_job,
+    model_training_job,
 )
 from orchestration.retention import retention_job
 from orchestration.schedules import (
@@ -32,7 +32,8 @@ from orchestration.schedules import (
 from orchestration.sensors import (
     annotation_collect_sensor,
     ingest_kafka_sensor,
-    ingest_stuck_sensor,
+    platform_stuck_sensor,
+    training_kafka_sensor,
 )
 
 defs = Definitions(
@@ -46,16 +47,16 @@ defs = Definitions(
         entity_tag_index,
         dataset_asset,
         dataset_export_asset,
-        mock_train_assets,
+        model_training,
         analytics_summary,
     ],
-    asset_checks=[dataset_quality_gate, *freshness_checks],
+    asset_checks=[dataset_quality_gate, training_quality_gate, *freshness_checks],
     jobs=[
         ingest_append_job,
         ingest_correct_job,
         annotation_collect_job,
         freeze_dataset_job,
-        mock_train_job,
+        model_training_job,
         analytics_job,
         compaction_job,
         retention_job,
@@ -66,5 +67,5 @@ defs = Definitions(
         compaction_schedule,
         retention_schedule,
     ],
-    sensors=[ingest_kafka_sensor, ingest_stuck_sensor, annotation_collect_sensor],
+    sensors=[ingest_kafka_sensor, training_kafka_sensor, platform_stuck_sensor, annotation_collect_sensor],
 )
