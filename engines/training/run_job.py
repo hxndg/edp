@@ -4,21 +4,21 @@
 
     run pod                                     训练 worker pod
     ────────────────────────────────────        ───────────────────────────
-    Saga claim（scope=training，CAS 互斥）
+    execution_claim（scope=training，CAS 互斥）
     解析 dataset_sample 清单 → samples.parquet
     写 input.json 到 staging  ──────────────▶   读清单，逐样本 Lance 抽特征
-    提交 Argo Workflow（轮询时刷 saga 心跳）       SGD 逐 epoch 训练
+    提交 Argo Workflow（轮询时续 claim）            SGD 逐 epoch 训练
                                                 ├ MLflow 打点（best-effort）
                                                 ├ 权重直传 MinIO models/
     收 manifest.json（指标/版本/error_code）◀──    └ manifest + eval.parquet 收尾
     归档四表（每表一次 commit，job_id 幂等键）
-    saga succeed → platform_job done
+    最终事务 → platform_job done + release claim
 
 失败语义（common/errors.py）：
-- worker 业务失败（数据集为空等）：manifest 带码 → saga fail + platform_job failed；
+- worker 业务失败（数据集为空等）：manifest 带码 → platform_job failed；
 - pod 级失败（OOM/超时/丢失）：无清单 → PodOutcome.classify() 推断码；
 - run 侧失败（归档 commit / PG 挂）：classify_exception(where="run") 定码后上抛。
-重试由 watchdog 按码决定（common/jobs.py），OOM 重试时 worker 内存自动升档。
+Argo 管 task retry、OOM 内存升档和 phase/exit/log；Dagster只写最终业务摘要。
 
 **以 PG 状态为起点**：status=done 的 job 直接跳过，UI Re-execute 天然安全。
 归档以 job_id 为幂等键（upsert / replace_where），重跑不产生重复档案。
@@ -32,13 +32,12 @@ from datetime import datetime, timezone
 import pyarrow as pa
 
 from common.audit import make_batch_id
-from common.config import settings
-from common.db import execute, fetch_one, to_json
+from common.db import fetch_one, to_json, transaction
 from common.errors import ErrorCode, classify_exception, format_error
+from common.execution_claim import ClaimBatch
 from common.iceberg import in_filter, load_table, replace_where, upsert, with_audit_columns
-from common.runtime_config import get_int, get_str
-from common.saga import Saga, SagaConflictError
-from common.argo_workflows import WorkerSpec, launch_wave
+from common.processing_registry import ProcessingDefinition, resolve_processing_type
+from common.argo_workflows import PodOutcome, WorkerSpec, launch_wave
 from engines.worker import staging
 from schemas.iceberg_tables import (
     DATASET_SAMPLE,
@@ -55,11 +54,13 @@ SCOPE = "training"
 
 
 class TrainingFailed(Exception):
-    """业务级训练失败：saga/platform_job 已按码落终态，携带码上抛让 run 显式失败。"""
+    """携带 worker/Argo 终局事实，由 run 外壳一次性写业务终态。"""
 
-    def __init__(self, code: ErrorCode, message: str):
+    def __init__(self, code: ErrorCode, message: str, outcome: PodOutcome | None = None):
         super().__init__(format_error(code, message))
         self.code = code
+        self.message = message
+        self.outcome = outcome
 
 
 def run_training(job_id: str, op_context) -> dict:
@@ -72,39 +73,45 @@ def run_training(job_id: str, op_context) -> dict:
         logger.info("job %s 不存在/已 done，跳过（UI Re-execute 的幂等路径）", job_id)
         return {"status": "skipped", "job_id": job_id}
 
-    saga = Saga(SCOPE, job_id, run_id)
+    processing_type = (row["payload"] or {}).get("processing_type", "training_mock")
+    definition = resolve_processing_type(processing_type, expected_kind="training")
+    claim = ClaimBatch(SCOPE, [job_id], run_id)
+    with transaction() as conn:
+        claimed = claim.acquire_many(conn=conn)
+        if not claimed:
+            return {"status": "skipped", "job_id": job_id, "reason": "被另一个活跃 run 持有"}
+        conn.execute(
+            """
+            UPDATE platform_job SET status = 'running', last_dagster_run_id = %s,
+                last_execution_profile_id = %s,
+                last_error_code = NULL, last_error = NULL, updated_at = now()
+            WHERE job_id = %s
+            """,
+            (run_id, definition.profile.profile_id, job_id),
+        )
     try:
-        saga.claim()
-    except SagaConflictError as e:
-        logger.warning("%s", e)
-        return {"status": "skipped", "job_id": job_id, "reason": "saga 被另一个活跃 run 持有"}
-
-    execute(
-        "UPDATE platform_job SET status = 'running', updated_at = now() WHERE job_id = %s",
-        (job_id,),
-    )
-    try:
-        result = _execute(row, saga, run_id, op_context)
-    except TrainingFailed:
-        raise  # 终态已由 _fail 落好，不要重复分类
+        result = _execute(row, claim, run_id, definition)
+    except TrainingFailed as e:
+        _finalize_training(claim, job_id, run_id, error=(e.code, e.message), outcome=e.outcome)
+        raise
     except Exception as e:  # noqa: BLE001 - run 侧异常（典型：归档 commit / PG 故障）
         code = classify_exception(e, where="run")
-        _fail(saga, job_id, run_id, code, f"{type(e).__name__}: {e}")
+        _finalize_training(claim, job_id, run_id, error=(code, f"{type(e).__name__}: {e}"))
         raise
 
+    _finalize_training(claim, job_id, run_id, result=result)
     return result
 
 
-def _execute(row: dict, saga: Saga, run_id: str, op_context) -> dict:
+def _execute(
+    row: dict, claim: ClaimBatch, run_id: str, definition: ProcessingDefinition
+) -> dict:
     job_id = row["job_id"]
     payload = row["payload"]
 
     # ---- PREPARE：解析冻结清单，物化 worker 输入（worker 不碰 Iceberg catalog）----
-    saga.advance("PREPARE")
     samples = _resolve_samples(payload["dataset_version"])
     if not samples:
-        _fail(saga, job_id, run_id, ErrorCode.DATA_EMPTY,
-              f"dataset_version {payload['dataset_version']} 不存在或没有样本")
         raise TrainingFailed(ErrorCode.DATA_EMPTY, f"dataset_version {payload['dataset_version']} 无样本")
 
     prefix = staging.prefix(run_id, job_id)
@@ -125,47 +132,45 @@ def _execute(row: dict, saga: Saga, run_id: str, op_context) -> dict:
     )
 
     # ---- TRAIN：提交 Argo Workflow 拉起训练 worker（fan-out=1），等待并收清单 ----
-    saga.advance("TRAIN")
-    timeout = get_int("TRAIN_WORKER_TIMEOUT_SECONDS", 1800)
-    tiers = [t.strip() for t in get_str("TRAIN_WORKER_MEMORY_TIERS", "1Gi,2Gi,4Gi").split(",") if t.strip()]
-    attempt = saga.attempt or 1
+    profile = definition.profile
     spec = WorkerSpec(
         upload_id=job_id,
         staging_prefix=prefix,
-        memory_limit=tiers[min(attempt, len(tiers)) - 1],
+        memory_tiers=list(profile.memory_tiers),
         command=[
-            "python", "-m", "engines.worker.train_mock",
+            "python", "-m", definition.worker_module,
             "--job-id", job_id,
             "--run-id", run_id,
             "--staging-prefix", prefix,
         ],
     )
     outcomes = launch_wave(
-        op_context,
         [spec],
         run_id=run_id,
-        timeout_seconds=timeout,
-        # 心跳防 watchdog 误判 owner 已死；fencing 在下一次 advance 边界统一检查
-        heartbeat=lambda: saga.advance("TRAIN"),
+        timeout_seconds=profile.timeout_seconds,
+        heartbeat=lambda: claim.heartbeat_many([job_id]),
+        parallelism=profile.parallelism,
+        workflow_template_name=profile.workflow_template_name,
+        image_ref=profile.image_ref,
+        processing_type=definition.processing_type,
+        execution_profile_id=profile.profile_id,
     )
 
     manifest = staging.try_read_json(f"{prefix}/{staging.MANIFEST_JSON}")
+    outcome = outcomes.get(job_id)
     if manifest is None:
-        code, detail = outcomes[job_id].classify()
-        _fail(saga, job_id, run_id, code, detail)
-        raise TrainingFailed(code, detail)
+        code, detail = (outcome.classify() if outcome else (ErrorCode.WORKER_LOST, "无 Argo 观测"))
+        raise TrainingFailed(code, detail, outcome)
     if manifest.get("status") != "ok":
         code = ErrorCode(manifest.get("error_code") or ErrorCode.INTERNAL.value)
         detail = manifest.get("error", "worker 报告未知错误")
-        _fail(saga, job_id, run_id, code, detail)
-        raise TrainingFailed(code, detail)
+        raise TrainingFailed(code, detail, outcome)
 
     # ---- ARCHIVE：归档四表（单写者，job_id 幂等键，每表一次 commit）----
-    saga.advance("ARCHIVE")
-    _archive(job_id, payload, manifest, run_id)
+    if job_id not in claim.heartbeat_many([job_id]):
+        raise RuntimeError(f"training job {job_id} 已被其他 run 接管")
+    _archive(job_id, payload, manifest, run_id, image_ref=profile.image_ref)
 
-    # ---- 终态 ----
-    saga.succeed()
     result_summary = {
         "model_name": manifest["model_name"],
         "model_version": job_id,
@@ -175,10 +180,6 @@ def _execute(row: dict, saga: Saga, run_id: str, op_context) -> dict:
         "metrics": manifest["metrics"],
         "dataset_version": manifest["dataset_version"],
     }
-    execute(
-        "UPDATE platform_job SET status = 'done', result = %s, updated_at = now() WHERE job_id = %s",
-        (to_json(result_summary), job_id),
-    )
     return {"status": "done", "job_id": job_id, **result_summary}
 
 
@@ -213,7 +214,9 @@ def _resolve_samples(dataset_version: str) -> list[dict]:
     ]
 
 
-def _archive(job_id: str, payload: dict, manifest: dict, run_id: str) -> None:
+def _archive(
+    job_id: str, payload: dict, manifest: dict, run_id: str, *, image_ref: str
+) -> None:
     batch_id = make_batch_id(robot_id="training", upload_id=job_id)
     source = f"platform_job:{job_id}"
     now = datetime.now(timezone.utc)
@@ -231,7 +234,7 @@ def _archive(job_id: str, payload: dict, manifest: dict, run_id: str) -> None:
             "dataset_version": manifest["dataset_version"],
             "mlflow_run_id": manifest.get("mlflow_run_id"),
             "mlflow_experiment": manifest.get("mlflow_experiment"),
-            "image": settings.edp_image,
+            "image": image_ref,
             "params_json": json.dumps(manifest.get("params") or {}, ensure_ascii=False),
             "seed": int(manifest["seed"]),
             "metrics_json": json.dumps(manifest["metrics"], ensure_ascii=False),
@@ -282,15 +285,56 @@ def _archive(job_id: str, payload: dict, manifest: dict, run_id: str) -> None:
     )
 
 
-def _fail(saga: Saga, job_id: str, run_id: str, code: ErrorCode, message: str) -> None:
-    error = format_error(code, message)
-    if saga.fail(error, error_code=code.value):
-        execute(
-            "UPDATE platform_job SET status = 'failed', updated_at = now() WHERE job_id = %s AND status = 'running'",
-            (job_id,),
-        )
-        execute(
-            "INSERT INTO alerts (severity, source, run_id, message, context) VALUES (%s,%s,%s,%s,%s)",
-            ("error", SCOPE, run_id, f"training job {job_id} 失败：{error}",
-             to_json({"job_id": job_id, "error_code": code.value, "error": message})),
-        )
+def _finalize_training(
+    claim: ClaimBatch,
+    job_id: str,
+    run_id: str,
+    *,
+    result: dict | None = None,
+    error: tuple[ErrorCode, str] | None = None,
+    outcome: PodOutcome | None = None,
+) -> bool:
+    """仅当前 claim owner 可写最终业务态；写入与 release 在同一事务。"""
+    with transaction() as conn:
+        owned = conn.execute(
+            """
+            SELECT 1 FROM execution_claim
+            WHERE scope = %s AND business_id = %s AND run_id = %s
+            FOR UPDATE
+            """,
+            (claim.scope, job_id, run_id),
+        ).fetchone()
+        if owned is None:
+            return False
+        if error is None:
+            conn.execute(
+                """
+                UPDATE platform_job
+                SET status = 'done', result = %s, last_error_code = NULL,
+                    last_error = NULL, updated_at = now()
+                WHERE job_id = %s AND last_dagster_run_id = %s
+                """,
+                (to_json({k: v for k, v in (result or {}).items() if k not in ("status", "job_id")}), job_id, run_id),
+            )
+        else:
+            code, message = error
+            context = {"job_id": job_id, "error_code": code.value, "error": message}
+            if outcome is not None:
+                context["argo"] = outcome.to_dict()
+            conn.execute(
+                """
+                UPDATE platform_job
+                SET status = 'failed', last_error_code = %s, last_error = %s, updated_at = now()
+                WHERE job_id = %s AND last_dagster_run_id = %s
+                """,
+                (code.value, message[:2000], job_id, run_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO alerts (severity, source, run_id, message, context)
+                VALUES ('error', %s, %s, %s, %s)
+                """,
+                (SCOPE, run_id, f"training job {job_id} 失败：{format_error(code, message)}", to_json(context)),
+            )
+        claim.release_many([job_id], conn=conn)
+    return True

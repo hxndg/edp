@@ -62,7 +62,7 @@ def run(*, run_id: str, strategy_id: str | None = None) -> dict:
 
     from common.audit import make_batch_id
     from common.iceberg import with_audit_columns, upsert
-    from common.saga import uncommitted_episode_ids
+    from common.ingest_state import uncommitted_episode_ids
     from common.strategy_registry import run_strategy
     from engines.duckdb.duckdb_conn import iceberg_arrow, query
     from schemas.iceberg_tables import ENTITY_TAG

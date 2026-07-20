@@ -1,5 +1,5 @@
--- platform 库 DDL —— 业务瞬态状态（README 3.1.2）
--- 这些表只做"当前状态点查"，理论上可从 Iceberg 快照 + Kafka 事件重放重建，不是数据 SoT。
+-- platform 库 DDL —— 业务生命周期 SoT 与运行配置（README 3.1.2）。
+-- Iceberg 是已提交数据事实的 SoT；两者职责不同。
 -- 由 docker-compose 的 postgres 初始化脚本在容器首次启动时自动执行一次。
 
 CREATE TABLE IF NOT EXISTS upload_session (
@@ -9,25 +9,20 @@ CREATE TABLE IF NOT EXISTS upload_session (
     operator            TEXT,
     manifest_op         TEXT NOT NULL CHECK (manifest_op IN ('append', 'correct')),
     pipeline_profile    TEXT NOT NULL CHECK (pipeline_profile IN ('auto_only', 'human_required')),
+    processing_type     TEXT NOT NULL DEFAULT 'mcap_imu',
     status              TEXT NOT NULL DEFAULT 'created'
                         CHECK (status IN ('created', 'uploading', 'ready', 'ingesting', 'done', 'failed')),
     manifest_uri        TEXT,
     manifest            JSONB,
+    last_dagster_run_id TEXT,
+    last_execution_profile_id TEXT,
+    last_error_code     TEXT,
+    last_error          TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE IF NOT EXISTS ingest_job (
-    job_id              TEXT PRIMARY KEY,
-    upload_id           TEXT NOT NULL REFERENCES upload_session(upload_id),
-    op                  TEXT NOT NULL CHECK (op IN ('append', 'correct')),
-    dagster_run_id      TEXT,
-    status              TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
-    error_message       TEXT,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+CREATE INDEX IF NOT EXISTS idx_upload_session_last_run
+    ON upload_session (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;
 
 -- 通用异步任务状态机（README 3.1.2.1 / 3.7.4）：job_type 区分类型（MVP 只有
 -- training），payload/result JSONB 装类型专属字段，协议层（common/jobs.py）不解释。
@@ -40,10 +35,86 @@ CREATE TABLE IF NOT EXISTS platform_job (
     payload             JSONB NOT NULL DEFAULT '{}',
     result              JSONB NOT NULL DEFAULT '{}',
     requested_by        TEXT,
+    last_dagster_run_id TEXT,
+    last_execution_profile_id TEXT,
+    last_error_code     TEXT,
+    last_error          TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_platform_job_type_status ON platform_job (job_type, status);
+CREATE INDEX IF NOT EXISTS idx_platform_job_last_run
+    ON platform_job (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;
+
+-- 不可变执行 Profile：模板、镜像与资源有任何变化都插入新 profile_id；
+-- processing_type_definition 仅移动 active 指针，新旧 run 因而可并存和回滚。
+CREATE TABLE IF NOT EXISTS worker_execution_profile (
+    profile_id              TEXT PRIMARY KEY,
+    workflow_template_name  TEXT NOT NULL,
+    contract_version        TEXT NOT NULL,
+    image_ref               TEXT NOT NULL,
+    memory_tiers            JSONB NOT NULL,
+    timeout_seconds         INT NOT NULL CHECK (timeout_seconds > 0),
+    parallelism             INT NOT NULL CHECK (parallelism > 0),
+    chunk_rows              INT NOT NULL DEFAULT 50000 CHECK (chunk_rows > 0),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS processing_type_definition (
+    processing_type             TEXT PRIMARY KEY,
+    job_kind                    TEXT NOT NULL CHECK (job_kind IN ('ingest', 'training')),
+    worker_module               TEXT NOT NULL,
+    strategy_stage              TEXT,
+    strategy_id                 TEXT,
+    active_execution_profile_id TEXT NOT NULL REFERENCES worker_execution_profile(profile_id),
+    enabled                     BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO worker_execution_profile (
+    profile_id, workflow_template_name, contract_version, image_ref,
+    memory_tiers, timeout_seconds, parallelism, chunk_rows
+) VALUES
+    ('ingest-mcap-v1', 'edp-worker-batch-v1', 'v1', 'edp:dev',
+     '["1Gi","2Gi","4Gi"]', 600, 20, 50000),
+    ('training-mock-v1', 'edp-worker-batch-v1', 'v1', 'edp:dev',
+     '["1Gi","2Gi","4Gi"]', 1800, 1, 50000)
+ON CONFLICT (profile_id) DO NOTHING;
+
+INSERT INTO processing_type_definition (
+    processing_type, job_kind, worker_module, strategy_stage, strategy_id,
+    active_execution_profile_id
+) VALUES
+    ('mcap_imu', 'ingest', 'engines.worker.ingest_parse', 'silver_clean', 'default', 'ingest-mcap-v1'),
+    ('training_mock', 'training', 'engines.worker.train_mock', NULL, NULL, 'training-mock-v1')
+ON CONFLICT (processing_type) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION reject_worker_execution_profile_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'worker_execution_profile is immutable; insert a new profile_id instead';
+END;
+$$;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'worker_execution_profile_immutable') THEN
+        CREATE TRIGGER worker_execution_profile_immutable
+        BEFORE UPDATE OR DELETE ON worker_execution_profile
+        FOR EACH ROW EXECUTE FUNCTION reject_worker_execution_profile_mutation();
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_upload_processing_type') THEN
+        ALTER TABLE upload_session ADD CONSTRAINT fk_upload_processing_type
+        FOREIGN KEY (processing_type) REFERENCES processing_type_definition(processing_type);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_upload_last_execution_profile') THEN
+        ALTER TABLE upload_session ADD CONSTRAINT fk_upload_last_execution_profile
+        FOREIGN KEY (last_execution_profile_id) REFERENCES worker_execution_profile(profile_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_job_last_execution_profile') THEN
+        ALTER TABLE platform_job ADD CONSTRAINT fk_job_last_execution_profile
+        FOREIGN KEY (last_execution_profile_id) REFERENCES worker_execution_profile(profile_id);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS annotation_batch (
     batch_id            TEXT PRIMARY KEY,
@@ -74,25 +145,16 @@ CREATE TABLE IF NOT EXISTS dataset_request (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Saga 执行日志（docs/saga-consistency-guide.md）：跨多次 Iceberg commit 的引擎流程
--- （ingest_append / ingest_correct）的"事务外壳"。一个 (scope, business_id) 同一时刻
--- 只允许一个 RUNNING 的 owner（run_id 即 fencing token），并发触发靠 claim 的 CAS 挡掉。
--- 注意：common/saga.py 启动时也会 CREATE TABLE IF NOT EXISTS 一份同样的 DDL，
--- 保证老部署（postgres 卷已初始化过、不会重跑本脚本）也能拿到这张表。
-CREATE TABLE IF NOT EXISTS saga_log (
-    scope               TEXT NOT NULL,          -- 业务流程名：ingest_append / ingest_correct
-    business_id         TEXT NOT NULL,          -- 业务主键：upload_id
-    run_id              TEXT NOT NULL,          -- 当前 owner 的 Dagster run_id（fencing token）
-    status              TEXT NOT NULL DEFAULT 'RUNNING'
-                        CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED')),
-    step                TEXT NOT NULL DEFAULT 'CLAIM',  -- 最近推进到的步骤，advance() 时更新（兼作心跳）
-    attempt             INT  NOT NULL DEFAULT 1,        -- 第几次尝试，claim 接管时 +1，用于限制自动重试
-    error_code          TEXT,                           -- common/errors.py 状态码，重试层按它决定是否自动重试
-    error               TEXT,
-    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+-- 执行租约：只表达当前哪个 Dagster run 有权处理该业务 id。Argo 保存 task 的
+-- phase/exit/retry/log，业务终态与最后一次 run 关联写回 upload_session/platform_job。
+CREATE TABLE IF NOT EXISTS execution_claim (
+    scope               TEXT NOT NULL,
+    business_id         TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    heartbeat_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (scope, business_id)
 );
+CREATE INDEX IF NOT EXISTS idx_execution_claim_heartbeat ON execution_claim (heartbeat_at);
 
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id            BIGSERIAL PRIMARY KEY,
@@ -118,16 +180,8 @@ INSERT INTO runtime_config (key, value, description) VALUES
     ('INGEST_BATCH_MAX', '200', '单个微批最多合并多少条 ingest.requested 消息（README 3.6.2）'),
     ('INGEST_MAX_INFLIGHT_BATCHES', '3', '同时在跑（排队+执行中）的 ingest 批次上限，达到即暂停消费 Kafka'),
     ('RETENTION_DAYS', '30', 'Dagster run 记录与 PG 终态行的保留天数（README 3.6.4）'),
-    ('INGEST_WORKER_TIMEOUT_SECONDS', '600', '单个解析 worker pod 的硬超时（README 3.6.3，activeDeadlineSeconds）'),
-    ('INGEST_WORKER_MAX_PARALLEL', '20', '同时在跑的解析 worker pod 数上限（README 3.6.3，分波调度）'),
-    ('INGEST_WORKER_MEMORY_TIERS', '1Gi,2Gi,4Gi', 'worker 内存 limit 按 saga attempt 升档（OOM 自动重试时用更高档）'),
-    ('INGEST_WORKER_CHUNK_ROWS', '50000', 'worker 流式解析的分块行数（bronze/silver 每 N 行 flush 一个 row group）'),
-    ('INGEST_RETRY_BACKOFF_MINUTES', '5', 'failed 会话按 error_code 自动重试前的退避分钟数（stuck sensor）'),
     ('STAGING_RETENTION_DAYS', '7', 'MinIO staging/ 交接区残留文件的保留天数（README 3.6.3，retention job 按 mtime 清）'),
     ('TRAIN_MAX_INFLIGHT', '2', '同时在跑（排队+执行中）的训练 run 上限（README 3.7.2 背压）'),
-    ('TRAIN_WORKER_TIMEOUT_SECONDS', '1800', '单个训练 worker pod 的硬超时（activeDeadlineSeconds，训练比解析长）'),
-    ('TRAIN_WORKER_MEMORY_TIERS', '1Gi,2Gi,4Gi', '训练 worker 内存 limit 按 saga attempt 升档（OOM 自动重试时用更高档）'),
-    ('TRAIN_RETRY_BACKOFF_MINUTES', '5', 'failed 训练任务按 error_code 自动重试前的退避分钟数（watchdog）'),
     ('TRAIN_GATE_MIN_ACCURACY', '0.6', 'training_quality_gate asset check 的 val_accuracy 门槛（不挡归档，挡 promote 的手）')
 ON CONFLICT (key) DO NOTHING;
 

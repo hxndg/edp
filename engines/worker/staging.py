@@ -62,11 +62,16 @@ def read_json(key: str) -> dict:
 
 
 def try_read_json(key: str) -> dict | None:
-    """worker 崩溃/超时/没调度上时 manifest 不存在——返回 None 交给调用方 fail_one。"""
+    """worker 崩溃/超时/没调度上时 manifest 不存在。"""
     try:
         return read_json(key)
     except Exception:  # noqa: BLE001 - NoSuchKey 及一切读取失败都视为"清单缺失"
         return None
+
+
+def clear_manifest(staging_prefix: str) -> None:
+    """每次 Argo retry 前清旧清单，防止上一 attempt 的结果污染最终判断。"""
+    object_store.delete_keys([f"{staging_prefix}/{MANIFEST_JSON}"])
 
 
 def write_parquet(key: str, rows: list[dict]) -> int:

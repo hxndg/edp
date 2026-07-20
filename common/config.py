@@ -67,18 +67,11 @@ class Settings:
 
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
 
-    # Saga（docs/saga-consistency-guide.md）：RUNNING 状态多久没有心跳（advance）
-    # 就允许被新的 run 接管 / 被 stuck sensor 重新入队
-    saga_takeover_minutes: int = field(default_factory=lambda: int(_env("SAGA_TAKEOVER_MINUTES", "30")))
-    # stuck 自动重试上限：超过后不再自动入队，转为 failed + alert 等人工介入
-    saga_max_attempts: int = field(default_factory=lambda: int(_env("SAGA_MAX_ATTEMPTS", "3")))
-
-    # pod fan-out（README 3.6.3）：run pod 给批内每个 upload 起 worker Job 用的镜像
-    # 与命名空间。镜像默认复用 code location 注入的 DAGSTER_CURRENT_IMAGE——
-    # "worker 跑的代码 == 编排看到的代码"，与 run pod 同源。
-    edp_image: str = field(
-        default_factory=lambda: _env("EDP_IMAGE", os.environ.get("DAGSTER_CURRENT_IMAGE", "edp:dev"))
+    # 薄执行租约多久无心跳可被接管；兼容旧环境变量名。
+    claim_takeover_minutes: int = field(
+        default_factory=lambda: int(_env("CLAIM_TAKEOVER_MINUTES", _env("SAGA_TAKEOVER_MINUTES", "30")))
     )
+
     k8s_namespace: str = field(default_factory=lambda: _env("K8S_NAMESPACE", "data"))
 
     @property

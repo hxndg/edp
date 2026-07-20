@@ -29,6 +29,7 @@ def _gateway_base_url(override: str | None) -> str:
 @click.option("--operator", default="datagen")
 @click.option("--manifest-op", type=click.Choice(["append", "correct"]), default="append")
 @click.option("--pipeline-profile", type=click.Choice(["auto_only", "human_required"]), default="auto_only")
+@click.option("--processing-type", default="mcap_imu", help="业务处理类型，由 PG 注册表解析执行 Profile")
 @click.option("--files", multiple=True, help="要上传的 mcap 文件路径；不填则用 fixtures 目录下最新一个文件")
 @click.option("--fixtures-dir", default="tools/datagen/fixtures")
 @click.option("--episode-id", default=None, help="manifest_op=correct 时必填")
@@ -41,6 +42,7 @@ def main(
     operator: str,
     manifest_op: str,
     pipeline_profile: str,
+    processing_type: str,
     files: tuple[str, ...],
     fixtures_dir: str,
     episode_id: str | None,
@@ -64,12 +66,16 @@ def main(
             "operator": operator,
             "manifest_op": manifest_op,
             "pipeline_profile": pipeline_profile,
+            "processing_type": processing_type,
         },
         timeout=10,
     )
     session_resp.raise_for_status()
     upload_id = session_resp.json()["upload_id"]
-    click.echo(f"创建 upload session: {upload_id} (manifest_op={manifest_op}, pipeline_profile={pipeline_profile})")
+    click.echo(
+        f"创建 upload session: {upload_id} "
+        f"(manifest_op={manifest_op}, pipeline_profile={pipeline_profile}, processing_type={processing_type})"
+    )
 
     manifest_files = []
     for path in file_list:

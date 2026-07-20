@@ -53,11 +53,23 @@ def health() -> dict:
 
 @app.post("/sessions", response_model=CreateSessionResponse)
 def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
+    from common.processing_registry import ProcessingTypeNotFound, resolve_processing_type
+
+    try:
+        resolve_processing_type(req.processing_type, expected_kind="ingest")
+    except ProcessingTypeNotFound as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
     upload_id = f"upload-{uuid.uuid4().hex[:10]}"
     execute(
         """
-        INSERT INTO upload_session (upload_id, robot_id, task_id, operator, manifest_op, pipeline_profile, status)
-        VALUES (%(upload_id)s, %(robot_id)s, %(task_id)s, %(operator)s, %(manifest_op)s, %(pipeline_profile)s, 'created')
+        INSERT INTO upload_session (
+            upload_id, robot_id, task_id, operator, manifest_op,
+            pipeline_profile, processing_type, status
+        )
+        VALUES (
+            %(upload_id)s, %(robot_id)s, %(task_id)s, %(operator)s, %(manifest_op)s,
+            %(pipeline_profile)s, %(processing_type)s, 'created'
+        )
         """,
         {
             "upload_id": upload_id,
@@ -66,11 +78,16 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
             "operator": req.operator,
             "manifest_op": req.manifest_op,
             "pipeline_profile": req.pipeline_profile,
+            "processing_type": req.processing_type,
         },
     )
     emit("upload.created", key=upload_id, payload=req.model_dump())
     return CreateSessionResponse(
-        upload_id=upload_id, status="created", manifest_op=req.manifest_op, pipeline_profile=req.pipeline_profile
+        upload_id=upload_id,
+        status="created",
+        manifest_op=req.manifest_op,
+        pipeline_profile=req.pipeline_profile,
+        processing_type=req.processing_type,
     )
 
 
@@ -111,6 +128,7 @@ def submit_manifest(upload_id: str, req: ManifestSubmitRequest) -> dict:
         "affected_start_ts": req.affected_start_ts,
         "affected_end_ts": req.affected_end_ts,
         "manifest_op": session["manifest_op"],
+        "processing_type": session["processing_type"],
     }
     execute(
         """
@@ -132,10 +150,14 @@ def submit_manifest(upload_id: str, req: ManifestSubmitRequest) -> dict:
     )
     emit("manifest.submitted", key=upload_id, payload=manifest_payload)
     # 触发事件：ingest_kafka_sensor 消费这条消息拉起对应 job。发失败也没关系——
-    # session 已是 ready，T+1 兜底 schedule 轮询 PG 会补触发；重复发也没关系——
-    # sensor 端会校验 status=ready + run_key 去重 + saga claim 三层兜底。
-    emit_ingest_request(upload_id, session["manifest_op"])
-    return {"upload_id": upload_id, "status": "ready", "manifest_op": session["manifest_op"]}
+    # session 已是 ready，T+1 兜底 schedule 会补触发；重复消息由引擎薄 claim 去重。
+    emit_ingest_request(upload_id, session["manifest_op"], session["processing_type"])
+    return {
+        "upload_id": upload_id,
+        "status": "ready",
+        "manifest_op": session["manifest_op"],
+        "processing_type": session["processing_type"],
+    }
 
 
 def _manual_retry_or_http(kind, business_id: str) -> dict:
@@ -158,8 +180,7 @@ def retry_session(upload_id: str) -> dict:
     done 的廉价跳过）互补：这里是单 upload 粒度、不需要找到原来的 run。
 
     只允许 failed → ready（common/jobs.py::manual_retry，与训练 retry 共用实现）。
-    重置 updated_at → 新 run_key；引擎侧 saga claim 的 attempt 会继续累加，
-    OOM 类失败重试时 worker 内存自动升档（INGEST_WORKER_MEMORY_TIERS）。
+    新 run 会写回 last_dagster_run_id；单次 Workflow 内的重试与内存升档归 Argo。
     """
     from common.jobs import UPLOAD_KIND
 
@@ -170,7 +191,7 @@ def retry_session(upload_id: str) -> dict:
         "upload_id": upload_id,
         "status": result["status"],
         "manifest_op": session["manifest_op"],
-        "previous_attempt": result["previous_attempt"],
+        "previous_run_id": result["previous_run_id"],
         "previous_error_code": result["previous_error_code"],
         "previous_error": result["previous_error"],
     }
@@ -249,6 +270,12 @@ def create_training_job(req: TrainRequestIn) -> TrainJobOut:
     网关保持薄：不校验 dataset_version 是否存在（那要碰 Iceberg）——不存在
     由训练 run 以 DATA_EMPTY 终态报出，状态可查、不自动重试。"""
     import random
+    from common.processing_registry import ProcessingTypeNotFound, resolve_processing_type
+
+    try:
+        resolve_processing_type(req.processing_type, expected_kind="training")
+    except ProcessingTypeNotFound as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
 
     payload = {
         "model_name": req.model_name,
@@ -257,6 +284,7 @@ def create_training_job(req: TrainRequestIn) -> TrainJobOut:
         "params": req.params,
         # seed 此刻固定进 payload：dataset_version + image + params + seed 是复现配方
         "seed": req.seed if req.seed is not None else random.randint(0, 2**31 - 1),
+        "processing_type": req.processing_type,
     }
     from common.jobs import create_job
 
@@ -277,16 +305,15 @@ def _get_training_job_or_404(job_id: str) -> dict:
 @app.get("/training-jobs/{job_id}", response_model=TrainJobOut)
 def get_training_job(job_id: str) -> TrainJobOut:
     row = _get_training_job_or_404(job_id)
-    saga = fetch_one(
-        "SELECT error_code, error FROM saga_log WHERE scope = 'training' AND business_id = %s", (job_id,)
-    )
     return TrainJobOut(
         job_id=job_id,
         status=row["status"],
         payload=row["payload"],
         result=row["result"],
-        error_code=saga["error_code"] if saga else None,
-        error=saga["error"] if saga else None,
+        last_dagster_run_id=row.get("last_dagster_run_id"),
+        last_execution_profile_id=row.get("last_execution_profile_id"),
+        error_code=row.get("last_error_code"),
+        error=row.get("last_error"),
     )
 
 

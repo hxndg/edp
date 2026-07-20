@@ -19,10 +19,11 @@ from dagster import AssetExecutionContext, AssetOut, Config, MetadataValue, Outp
 
 
 class IngestBatchConfig(Config):
-    """一个微批的内容：sensor 按 (tick, manifest_op) 分组后填进 RunRequest。"""
+    """一个微批：同一 manifest_op + processing_type，因而对应一个执行 Profile。"""
 
     upload_ids: list[str]
     manifest_op: str  # append | correct
+    processing_type: str
 
 
 @multi_asset(
@@ -42,11 +43,13 @@ def ingest_multi_asset(context: AssetExecutionContext, config: IngestBatchConfig
 
     # context 传给引擎：run_id 从它取（worker 由 Argo Workflow 监管，
     # 日志归档在 s3://lake/argo/，见 common/argo_workflows.py）
-    result = run_batch(config.upload_ids, context)
+    result = run_batch(config.upload_ids, config.processing_type, context)
     per_upload = result["per_upload"]
 
     batch_meta = {
         "manifest_op": config.manifest_op,
+        "processing_type": config.processing_type,
+        "execution_profile_id": result["execution_profile_id"],
         "num_requested": result["num_requested"],
         "num_claimed": result["num_claimed"],
         "num_succeeded": result["num_succeeded"],

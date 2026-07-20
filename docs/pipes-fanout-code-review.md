@@ -1,5 +1,9 @@
 # Pipes Fan-out 改造：逐行代码审核文档
 
+> **历史归档（不可作为现行设计）**：Pipes、`common/worker_pods.py`、`common/saga.py`
+> 与 `saga_log` 均已移除。现行实现见 README 3.3/3.6.3 和
+> `docs/argo-workflows-code-review.md`。
+
 > **2026-07-17 更新**：pod 的拉起/监督已从本文讲的 `common/worker_pods.py`
 > （PipesK8sClient）切换为 Argo Workflows（`common/argo_workflows.py`），
 > 新实现的逐行讲解见 `docs/argo-workflows-code-review.md`。本文中

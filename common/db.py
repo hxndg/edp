@@ -25,6 +25,17 @@ def get_conn() -> Iterator[psycopg.Connection]:
         conn.close()
 
 
+@contextlib.contextmanager
+def transaction() -> Iterator[psycopg.Connection]:
+    """显式事务：用于 claim + 业务状态、最终落态 + release 的原子切换。"""
+    conn = psycopg.connect(settings.platform_dsn, row_factory=dict_row, autocommit=False)
+    try:
+        with conn.transaction():
+            yield conn
+    finally:
+        conn.close()
+
+
 def execute(sql: str, params: dict | tuple | None = None) -> None:
     with get_conn() as conn:
         conn.execute(sql, params)

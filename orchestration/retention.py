@@ -8,8 +8,7 @@
 - Dagster run + event log（`dagster` 库）：删终态（成功/失败/取消）且创建时间
   超过保留期的 run，`instance.delete_run` 会连带删掉 event log；
   sensor/schedule tick 历史由 dagster.yaml 的 retention 配置负责，不在这里。
-- PG platform 库：终态的 saga_log / annotation_batch(DONE) / upload_session
-  (done/failed)。仍在 RUNNING/LABELING 的行不动——stuck sensor 还要靠它们对账。
+- PG platform 库：已释放的孤儿 claim、annotation_batch(DONE)、业务终态行。
 - MinIO staging/ 前缀（README 3.6.3 pod fan-out 的 run↔worker 交接区）：run
   结束后有意不删（保留现场方便排查 worker 问题），staging 文件不被 Iceberg
   快照引用、对读者不存在，这里按 mtime 超过 STAGING_RETENTION_DAYS 统一清。
@@ -22,6 +21,7 @@ from dagster import DagsterRunStatus, RunsFilter, job, op
 
 from common import object_store
 from common.db import fetch_all
+from common.execution_claim import ensure_schema as ensure_claim_schema
 from common.runtime_config import get_int
 from engines.worker.staging import STAGING_ROOT
 
@@ -56,11 +56,24 @@ def purge_expired_records(context) -> dict:
         if len(records) < _DELETE_PAGE_SIZE:
             break
 
-    # ---- PG platform 库终态行（顺序有讲究：先删引用 upload_session 的子表行）----
-    deleted_sagas = len(
+    # ---- 已无对应 running 业务行的孤儿租约 ----
+    ensure_claim_schema()
+    deleted_claims = len(
         fetch_all(
-            "DELETE FROM saga_log WHERE status <> 'RUNNING' AND updated_at < %s RETURNING business_id",
-            (cutoff,),
+            """
+            DELETE FROM execution_claim c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM upload_session us
+                WHERE c.scope IN ('ingest_append', 'ingest_correct')
+                  AND us.upload_id = c.business_id AND us.status = 'ingesting'
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM platform_job pj
+                WHERE c.scope = 'training'
+                  AND pj.job_id = c.business_id AND pj.status = 'running'
+            )
+            RETURNING business_id
+            """
         )
     )
     deleted_batches = len(
@@ -68,16 +81,6 @@ def purge_expired_records(context) -> dict:
             "DELETE FROM annotation_batch WHERE status = 'DONE' AND updated_at < %s RETURNING batch_id",
             (cutoff,),
         )
-    )
-    fetch_all(
-        """
-        DELETE FROM ingest_job
-        WHERE upload_id IN (
-            SELECT upload_id FROM upload_session WHERE status IN ('done', 'failed') AND updated_at < %s
-        )
-        RETURNING job_id
-        """,
-        (cutoff,),
     )
     # 通用状态机的终态任务行（training 等，README 3.7.4）：档案在 Iceberg ml_* 表
     from common.jobs import _ensure_table as _ensure_platform_job
@@ -115,7 +118,7 @@ def purge_expired_records(context) -> dict:
     summary = {
         "retention_days": days,
         "deleted_dagster_runs": deleted_runs,
-        "deleted_saga_logs": deleted_sagas,
+        "deleted_execution_claims": deleted_claims,
         "deleted_annotation_batches": deleted_batches,
         "deleted_upload_sessions": deleted_sessions,
         "deleted_platform_jobs": deleted_jobs,

@@ -1,5 +1,8 @@
 # Pod Fan-out 实现讲解：Pipes worker + run 单写者 commit + 错误码与重试 + K8s 权限
 
+> **历史归档（不可作为现行设计）**：本文描述已删除的 Pipes fan-out。现行 Argo
+> WorkflowTemplate、task retry 与薄 claim 见 `docs/argo-workflows-code-review.md`。
+
 对应 README 3.6.3。本文讲四件事：
 
 1. 这套 fan-out 的代码怎么分工、每个模块干什么（Dagster Pipes 形态）；

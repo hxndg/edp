@@ -20,12 +20,13 @@ import pyarrow as pa
 from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, LessThanOrEqual, Or
 
 from common.audit import make_batch_id
-from common.db import execute, fetch_all
+from common.db import fetch_all, transaction
 from common.errors import ErrorCode, classify_exception, format_error
+from common.execution_claim import ClaimBatch
 from common.iceberg import in_filter, load_table, replace_where_chunked, upsert
-from common.saga import SagaBatch
+from common.processing_registry import ProcessingDefinition, resolve_processing_type
 from common.strategy_registry import resolve
-from engines.spark.ingest_append import _fail_upload, _fan_out_parse, _upsert_thin
+from engines.spark.ingest_append import Failure, _fan_out_parse, _finalize_uploads, _upsert_thin
 from engines.worker import staging
 from schemas.iceberg_tables import (
     ANNOTATION,
@@ -43,40 +44,48 @@ logger = logging.getLogger(__name__)
 SCOPE = "ingest_correct"
 
 
-def run_batch(upload_ids: list[str], op_context) -> dict:
-    """批量 Saga 外壳，与 ingest_append.run_batch 相同（README 3.6.3）。
+def run_batch(upload_ids: list[str], processing_type: str, op_context) -> dict:
+    """薄 claim + Argo + 最终批量落态，与 ingest_append.run_batch 同构。
     同样以 PG 状态为起点：status = done 的 upload 廉价跳过，Re-execute 安全。"""
     run_id = op_context.run_id
+    definition = resolve_processing_type(processing_type, expected_kind="ingest")
     sessions = {
         row["upload_id"]: row
         for row in fetch_all(
-            "SELECT * FROM upload_session WHERE upload_id = ANY(%s) AND manifest_op = 'correct' AND status <> 'done'",
-            (list(upload_ids),),
+            """
+            SELECT * FROM upload_session
+            WHERE upload_id = ANY(%s) AND manifest_op = 'correct'
+              AND processing_type = %s AND status <> 'done'
+            """,
+            (list(upload_ids), processing_type),
         )
     }
     not_pending = [uid for uid in upload_ids if uid not in sessions]
     if not_pending:
         logger.info("跳过不存在/非 correct/已 done 的 upload：%s", not_pending)
 
-    batch = SagaBatch(SCOPE, list(sessions), run_id)
-    claimed = batch.claim_many()
+    batch = ClaimBatch(SCOPE, list(sessions), run_id)
+    with transaction() as conn:
+        claimed = batch.acquire_many(conn=conn)
+        if claimed:
+            conn.execute(
+                """
+                UPDATE upload_session
+                SET status = 'ingesting', last_dagster_run_id = %s,
+                    last_execution_profile_id = %s,
+                    last_error_code = NULL, last_error = NULL, updated_at = now()
+                WHERE upload_id = ANY(%s)
+                """,
+                (run_id, definition.profile.profile_id, claimed),
+            )
     skipped = [uid for uid in sessions if uid not in claimed]
-    if claimed:
-        execute(
-            "UPDATE upload_session SET status = 'ingesting', updated_at = now() WHERE upload_id = ANY(%s)",
-            (claimed,),
-        )
 
     try:
-        result = _execute_batch(sessions, claimed, run_id, batch, op_context)
+        result = _execute_batch(sessions, claimed, run_id, batch, definition)
     except Exception as e:  # noqa: BLE001
         code = classify_exception(e, where="run")
-        failed = batch.fail_many(claimed, format_error(code, f"{type(e).__name__}: {e}"), error_code=code.value)
-        if failed:
-            execute(
-                "UPDATE upload_session SET status = 'failed', updated_at = now() WHERE upload_id = ANY(%s) AND status = 'ingesting'",
-                (failed,),
-            )
+        detail = f"{type(e).__name__}: {e}"
+        _finalize_uploads(batch, [], {uid: (code, detail, None) for uid in claimed}, run_id)
         raise
 
     result["num_requested"] = len(upload_ids)
@@ -84,43 +93,57 @@ def run_batch(upload_ids: list[str], op_context) -> dict:
     return result
 
 
-def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, batch: SagaBatch, op_context) -> dict:
-    strategy = resolve("silver_clean", None)
+def _execute_batch(
+    sessions: dict[str, dict],
+    claimed: list[str],
+    run_id: str,
+    batch: ClaimBatch,
+    definition: ProcessingDefinition,
+) -> dict:
+    if not definition.strategy_stage:
+        raise ValueError(f"processing_type {definition.processing_type} 未配置清洗策略")
+    strategy = resolve(definition.strategy_stage, definition.strategy_id)
 
     # ---- 锚点准备：worker 不碰 catalog，episode 的 robot_id/start_ts 由 run pod
     # 一次批量读出，喂进各自的 input.json；episode 不存在的 upload 逐条隔离 ----
-    alive = batch.advance_many("PARSE", claimed)
-    anchors, failures = _load_episode_anchors(sessions, alive, run_id, batch)
+    anchors, failures = _load_episode_anchors(sessions, claimed)
 
     # ---- PARSE：fan-out 到 worker pod ----
     manifests, parse_failures = _fan_out_parse(
-        sessions, list(anchors), run_id, batch, strategy.entrypoint, op_context, mode="correct", extra_input=anchors
+        sessions,
+        list(anchors),
+        run_id,
+        batch,
+        definition,
+        strategy.entrypoint,
+        mode="correct",
+        extra_input=anchors,
     )
     failures.update(parse_failures)
 
-    def _advance(step: str) -> list[dict]:
-        ids = batch.advance_many(step, list(manifests))
+    def _alive() -> list[dict]:
+        ids = batch.heartbeat_many(list(manifests))
         return [manifests[uid] for uid in ids]
 
     # ---- RAW_INDEX：一次 upsert commit ----
-    ms = _advance("RAW_INDEX")
+    ms = _alive()
     _upsert_thin(RAW_FILE, ms)
 
     # ---- BRONZE / SILVER：本批所有受影响时间窗 Or 起来删旧 + 分块追加修正数据，
     # 每表一次事务式 commit（README 4.6：读者看不到"旧的没了新的没来"的空洞）----
-    ms = _advance("BRONZE")
+    ms = _alive()
     _replace_thick_ranged(BRONZE_IMU, ms)
-    ms = _advance("SILVER")
+    ms = _alive()
     _replace_thick_ranged(SILVER_IMU, ms)
 
     # ---- SAMPLES：重新切片的样本 upsert（确定性 sample_id 命中原样本）----
-    ms = _advance("SAMPLES")
+    ms = _alive()
     _upsert_thin(SAMPLE, ms)
     _upsert_thin(GOLD_SAMPLE_INDEX, ms)
 
     # ---- RESET_DOWNSTREAM：受影响 sample 的 annotation/qc_result 置 pending，
     # 本批合并成每表一次 upsert ----
-    ms = _advance("RESET_DOWNSTREAM")
+    ms = _alive()
     affected_sample_ids = sorted({sid for m in ms for sid in m.get("affected_sample_ids", [])})
     shared_batch_id = make_batch_id(robot_id="ingest_correct", upload_id=f"batch-{run_id[:8]}")
     num_reset_annotations = _reset_to_pending(
@@ -130,13 +153,7 @@ def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, b
         QC_RESULT, "target_id", affected_sample_ids, {"verdict": "need_review"}, "qc_id", shared_batch_id, run_id
     )
 
-    # ---- 终态 ----
-    succeeded = batch.succeed_many([m["upload_id"] for m in ms])
-    if succeeded:
-        execute(
-            "UPDATE upload_session SET status = 'done', updated_at = now() WHERE upload_id = ANY(%s)",
-            (succeeded,),
-        )
+    succeeded = _finalize_uploads(batch, [m["upload_id"] for m in ms], failures, run_id)
 
     per_upload = [
         {
@@ -154,19 +171,20 @@ def _execute_batch(sessions: dict[str, dict], claimed: list[str], run_id: str, b
         "num_claimed": len(claimed),
         "num_succeeded": len(succeeded),
         "num_failed": len(failures),
-        "failures": failures,
+        "failures": {uid: format_error(code, message) for uid, (code, message, _) in failures.items()},
         "per_upload": per_upload,
         "num_samples": sum(len(p["sample_ids"]) for p in per_upload),
         "quarantined_files": 0,
         "reset_annotations": num_reset_annotations,
         "reset_qc_results": num_reset_qc,
         "silver_clean_strategy_id": strategy.strategy_id,
+        "execution_profile_id": definition.profile.profile_id,
     }
 
 
 def _load_episode_anchors(
-    sessions: dict[str, dict], upload_ids: list[str], run_id: str, batch: SagaBatch
-) -> tuple[dict[str, dict], dict[str, str]]:
+    sessions: dict[str, dict], upload_ids: list[str]
+) -> tuple[dict[str, dict], dict[str, Failure]]:
     """批量读目标 episode 的锚点。返回 ({upload_id: {episode_id, robot_id, start_ts}}, 失败)。"""
     target_by_upload = {uid: sessions[uid]["manifest"]["episode_id"] for uid in upload_ids}
     rows = (
@@ -180,17 +198,14 @@ def _load_episode_anchors(
     episode_by_id = {r["episode_id"]: r for r in rows}
 
     anchors: dict[str, dict] = {}
-    failures: dict[str, str] = {}
+    failures: dict[str, Failure] = {}
     for uid, episode_id in target_by_upload.items():
         ep = episode_by_id.get(episode_id)
         if ep is None:
-            _fail_upload(
-                batch,
-                uid,
+            failures[uid] = (
                 ErrorCode.DATA_PARSE_ERROR,
                 f"要修正的 episode '{episode_id}' 不存在，correct 只能修正已有 episode",
-                run_id,
-                failures,
+                None,
             )
         else:
             anchors[uid] = {"episode_id": episode_id, "robot_id": ep["robot_id"], "start_ts": ep["start_ts"]}

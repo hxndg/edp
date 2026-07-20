@@ -14,7 +14,7 @@ import pyarrow as pa
 
 from common.audit import make_batch_id
 from common.iceberg import upsert, with_audit_columns
-from common.saga import uncommitted_episode_ids
+from common.ingest_state import uncommitted_episode_ids
 from engines.duckdb.duckdb_conn import iceberg_arrow, query
 from schemas.iceberg_tables import ANALYTICS_SUMMARY
 

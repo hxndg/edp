@@ -1,0 +1,71 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: edp-worker-batch-v1
+  namespace: data
+spec:
+  entrypoint: main
+  serviceAccountName: dagster
+  arguments:
+    parameters:
+      - name: items
+      - name: image
+      - name: timeout-seconds
+  volumes:
+    - name: lance
+      persistentVolumeClaim:
+        claimName: edp-lance
+  templates:
+    - name: main
+      dag:
+        failFast: false
+        tasks:
+          - name: worker
+            template: worker
+            withParam: "{{workflow.parameters.items}}"
+            arguments:
+              parameters:
+                - name: biz-id
+                  value: "{{item.biz_id}}"
+                - name: script
+                  value: "{{item.script}}"
+                - name: memory-0
+                  value: "{{item.memory_0}}"
+                - name: memory-1
+                  value: "{{item.memory_1}}"
+                - name: memory-2
+                  value: "{{item.memory_2}}"
+    - name: worker
+      inputs:
+        parameters:
+          - name: biz-id
+          - name: script
+          - name: memory-0
+          - name: memory-1
+          - name: memory-2
+      activeDeadlineSeconds: "{{workflow.parameters.timeout-seconds}}"
+      retryStrategy:
+        limit: "2"
+        retryPolicy: OnFailure
+        # 10 = 确定性业务错误；其它非零（含 20/137）由 Argo 重试。
+        expression: "lastRetry.exitCode != '10'"
+        backoff:
+          duration: "15s"
+          factor: 2
+          maxDuration: "2m"
+      metadata:
+        labels:
+          app: edp-worker
+      podSpecPatch: >-
+        {"containers":[{"name":"main","resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"memory":"{{=retries == 0 ? inputs.parameters['memory-0'] : (retries == 1 ? inputs.parameters['memory-1'] : inputs.parameters['memory-2'])}}"}}}]}
+      container:
+        image: "{{workflow.parameters.image}}"
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c"]
+        args: ["{{inputs.parameters.script}}"]
+        envFrom:
+          - configMapRef:
+              name: edp-env
+        volumeMounts:
+          - name: lance
+            mountPath: /data/lance

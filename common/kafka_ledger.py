@@ -1,5 +1,4 @@
-"""业务事件账本（README 2.2 原则 5 / 4.7）：Kafka 只用来记录"发生过什么"，
-永远不是触发源。触发只走 Dagster 自己的 schedule/sensor/API/webhook。
+"""Kafka 事件与异步任务触发消息。
 
 生产者是进程内单例、懒连接，避免网关每个请求都新建连接。事件写失败只打日志，
 不阻塞主流程——账本丢一条事件不影响 Iceberg 的数据事实，可从 Iceberg 重放补齐。
@@ -43,7 +42,7 @@ def emit(event_type: str, key: str, payload: dict[str, Any], *, topic: str | Non
         logger.exception("kafka ledger emit failed: event_type=%s key=%s", event_type, key)
 
 
-def emit_ingest_request(upload_id: str, manifest_op: str) -> None:
+def emit_ingest_request(upload_id: str, manifest_op: str, processing_type: str) -> None:
     """发一条 ingest 触发事件到专用 topic，由 `ingest_kafka_sensor` 消费拉起 run。
 
     与账本 emit 一样"尽力而为"：发失败不打断主流程——upload_session 已经是
@@ -52,7 +51,11 @@ def emit_ingest_request(upload_id: str, manifest_op: str) -> None:
     emit(
         "ingest.requested",
         key=upload_id,
-        payload={"upload_id": upload_id, "manifest_op": manifest_op},
+        payload={
+            "upload_id": upload_id,
+            "manifest_op": manifest_op,
+            "processing_type": processing_type,
+        },
         topic=settings.kafka_ingest_topic,
     )
 
@@ -60,8 +63,8 @@ def emit_ingest_request(upload_id: str, manifest_op: str) -> None:
 def emit_job_request(job_id: str, job_type: str) -> None:
     """发一条通用任务触发事件（README 3.7.4），由对应类型的 kafka sensor 消费。
 
-    同样尽力而为：platform_job 已是 ready，消息丢了由 watchdog 的
-    "ready 悬置修复"补发。
+    platform_job 已先落 ready；生产环境应以 outbox 或独立 ready 补投任务保证
+    PG/Kafka 双写一致性，watchdog 只处理已运行但心跳超时的任务。
     """
     emit(
         "job.requested",

@@ -1,5 +1,8 @@
 # 数据一致性与 Saga 实现指南
 
+> **历史归档（不可作为现行设计）**：`common/saga.py` 与 `saga_log` 已被删除。
+> 当前模型是 `execution_claim` 薄租约 + Argo task 真相 + PG 业务终态，见 README 3.3。
+
 本文回答三个问题：
 
 1. **一次 ingest 到底写了哪些表？每张表是什么含义？按什么顺序写？**

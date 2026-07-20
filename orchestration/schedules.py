@@ -16,13 +16,22 @@ def _fallback_run_requests(context: ScheduleEvaluationContext, manifest_op: str)
 
     与 kafka sensor 的互斥：正常情况下 sensor 已经把会话拉进 ingesting/done，
     这里查 status=ready 自然查不到；就算撞上（比如 sensor 刚发出 RunRequest、
-    引擎还没来得及置 ingesting），引擎侧 SagaBatch.claim_many() 的逐 upload
-    CAS 也保证同一个 upload 只有一个写者（docs/saga-consistency-guide.md）。
+    引擎还没来得及置 ingesting），引擎侧 execution_claim 的逐 upload
+    CAS 也保证同一个 upload 只有一个写者。
     """
     rows = _pending_upload_rows(manifest_op)
     batch_max = get_int("INGEST_BATCH_MAX", 200)
-    for i in range(0, len(rows), batch_max):
-        yield _batch_run_request(manifest_op, rows[i : i + batch_max], trigger="fallback_schedule")
+    by_type: dict[str, list[dict]] = {}
+    for row in rows:
+        by_type.setdefault(row["processing_type"], []).append(row)
+    for processing_type, typed_rows in by_type.items():
+        for i in range(0, len(typed_rows), batch_max):
+            yield _batch_run_request(
+                manifest_op,
+                processing_type,
+                typed_rows[i : i + batch_max],
+                trigger="fallback_schedule",
+            )
 
 
 @schedule(

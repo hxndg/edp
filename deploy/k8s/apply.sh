@@ -38,7 +38,7 @@ kubectl apply -f deploy/k8s/10-infra.yaml -f deploy/k8s/20-apps.yaml
 # 覆盖空的 workflow-controller-configmap）。镜像需预载：
 #   quay.io/argoproj/{workflow-controller,argocli,argoexec}:v4.0.7
 kubectl -n "$NS" apply --server-side -f deploy/k8s/argo/namespace-install-v4.0.7.yaml
-kubectl apply -f deploy/k8s/30-argo.yaml
+kubectl apply -f deploy/k8s/30-argo.yaml -f deploy/k8s/31-argo-worker-template.yaml
 # dev 环境免登录访问 Argo UI（生产应保留默认 client 认证）
 kubectl -n "$NS" patch deploy argo-server --type=json -p \
   '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--auth-mode=server"}]' \

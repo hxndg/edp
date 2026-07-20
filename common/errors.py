@@ -9,12 +9,12 @@
    （message 里的 OOMKilled / deadline）分类，见 common/argo_workflows.py。
 3. **run 侧自身错误**（commit 冲突、PG 挂了）：不经过 worker。
 
-每个码带**可重试性**标记，重试层（stuck sensor / gateway retry）按它决定：
-- RETRYABLE：瞬时环境问题，自动重试（attempt 上限内）；
+每个码带**可重试性**标记，worker 退出策略把它翻译给 Argo：
+- RETRYABLE：瞬时环境问题，由 Argo task retry；
 - NOT_RETRYABLE：数据自身的问题，重试一万次结果一样——直接终态 + 隔离 +
   alert，只有人工修数据后显式 reset 才会再跑；
 - NEEDS_ANALYSIS：OOM/超时这类"可能是资源配置问题也可能是数据问题"，
-  自动重试时升档资源（INGEST_WORKER_MEMORY_TIERS），升到顶仍失败转人工。
+  Argo retry 时按当前不可变执行 Profile 的 memory_tiers 升档。
 """
 from __future__ import annotations
 
@@ -114,6 +114,6 @@ def classify_exception(exc: BaseException, *, where: str = "worker") -> ErrorCod
 
 
 def format_error(code: ErrorCode | str, message: str) -> str:
-    """saga_log.error / alerts 的统一格式：`[CODE] message`，排查先看码。"""
+    """业务表错误摘要 / alerts 的统一格式：`[CODE] message`。"""
     code_str = code.value if isinstance(code, ErrorCode) else str(code)
     return f"[{code_str}] {message}"

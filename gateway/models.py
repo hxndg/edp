@@ -14,6 +14,7 @@ class CreateSessionRequest(BaseModel):
     operator: str | None = None
     manifest_op: ManifestOp = "append"
     pipeline_profile: PipelineProfile = "auto_only"
+    processing_type: str = "mcap_imu"
 
 
 class CreateSessionResponse(BaseModel):
@@ -21,6 +22,7 @@ class CreateSessionResponse(BaseModel):
     status: str
     manifest_op: ManifestOp
     pipeline_profile: PipelineProfile
+    processing_type: str
 
 
 class PresignRequest(BaseModel):
@@ -54,7 +56,12 @@ class SessionStatusResponse(BaseModel):
     task_id: str | None
     manifest_op: ManifestOp
     pipeline_profile: PipelineProfile
+    processing_type: str
     status: str
+    last_dagster_run_id: str | None = None
+    last_execution_profile_id: str | None = None
+    last_error_code: str | None = None
+    last_error: str | None = None
 
 
 class DatasetRequestIn(BaseModel):
@@ -105,7 +112,8 @@ class TagSearchResponse(BaseModel):
 
 class TrainRequestIn(BaseModel):
     """发起训练。复现配方四元组的用户侧三元：dataset_version + params + seed
-    （第四元 image 由部署决定）。seed 不填由网关生成后固定进 platform_job.payload。"""
+    （第四元 image 由 processing_type 对应的执行 Profile 决定）。
+    seed 不填由网关生成后固定进 platform_job.payload。"""
 
     model_config = {"protected_namespaces": ()}  # 允许 model_name 字段名
 
@@ -115,6 +123,7 @@ class TrainRequestIn(BaseModel):
     params: dict = Field(default_factory=dict, description='如 {"epochs": 8, "alpha": 0.001}')
     seed: int | None = None
     requested_by: str | None = None
+    processing_type: str = "training_mock"
 
 
 class TrainJobOut(BaseModel):
@@ -123,6 +132,8 @@ class TrainJobOut(BaseModel):
     status: str
     payload: dict = Field(default_factory=dict)
     result: dict = Field(default_factory=dict)
+    last_dagster_run_id: str | None = None
+    last_execution_profile_id: str | None = None
     error_code: str | None = None
     error: str | None = None
 

@@ -7,8 +7,8 @@
 职责边界（与 run pod 的契约见 engines/worker/staging.py）：
 - 只读 input.json（run pod 预先写好：session 快照、清洗策略入口、correct 的
   episode 锚点、chunk 大小），**不连 PG、不碰 Iceberg catalog、不调 K8s API**；
-- 业务失败也要**正常退出**（exit 0）：把 error_code + error 写进 manifest.json
-  （common/errors.py 的状态码），由 run pod 对该 upload 做 saga fail_one；
+- 业务失败把 error_code + error 写进 manifest.json；外层 exit_policy 将它翻译成
+  Argo 可判定的退出码（确定性数据错误不重试，瞬时错误重试）；
   只有 pod 级失败（OOM/超时）才表现为"没有清单"——死掉的进程自报不了，
   由 run pod 查 pod 终态推断码；
 - 数据契约以 staging 的 manifest.json 为准；若在 Dagster Pipes 环境下拉起

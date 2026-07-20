@@ -54,6 +54,9 @@ rules:
   - apiGroups: ["argoproj.io"]
     resources: ["workflows"]
     verbs: ["create", "get", "list", "watch", "delete", "patch"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflowtemplates"]
+    verbs: ["get"]
   # workflow pod 也以 dagster SA 运行：argoexec 上报节点结果需要
   - apiGroups: ["argoproj.io"]
     resources: ["workflowtaskresults"]
