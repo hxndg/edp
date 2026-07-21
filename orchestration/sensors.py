@@ -10,10 +10,10 @@ ingest 的实时触发消费 Kafka：gateway 提交 manifest 后向 `edp.ingest.
 可靠性模型（至少一次触发 + 引擎侧解读 SoT）：
 - offset 存在 Dagster sensor cursor 里，和 RunRequest 的提交一起持久化；
 - **Sensor 不查 PG SoT**：Kafka 只当叫醒铃；重放/过期消息照常组批发 run，
-  由引擎 `status <> 'done'` + `claim_many` CAS 决定真做或跳过（3.1.2.3）；
-- run_key 含本批消费位点盐，避免 stuck 再投后被 Dagster 当成同一 run 去重掉；
+  由引擎 `status = 'ready'` + `claim_many` CAS 决定真做或跳过（3.1.2.3）；
+- run_key 含本批消费位点盐，避免 Kafka 重投被 Dagster 当成同一 run 去重掉；
 - Kafka 消息丢了：T+1 兜底 schedule 仍轮询 PG ready；
-- 卡死：platform_stuck_sensor → ready + 再投 Kafka；
+- 卡死：reconciliation schedule 核对 Dagster/Argo 后落 failed + alert，不自动重投；
 - failed 重试：gateway manual_retry → ready + Kafka。
 """
 from __future__ import annotations
@@ -250,7 +250,7 @@ def ingest_kafka_sensor(context):
 )
 def training_kafka_sensor(context):
     """训练触发：一个 job = 一个 RunRequest。Sensor 不查 platform_job.status；
-    引擎入口 `status <> 'done'` + execution_claim 负责跳过/互斥。
+    引擎入口 `status = 'ready'` + execution_claim 负责跳过/互斥。
     """
     cursor: dict[str, int] = json.loads(context.cursor) if context.cursor else {}
     max_inflight = get_int("TRAIN_MAX_INFLIGHT", 2)
@@ -292,25 +292,6 @@ def training_kafka_sensor(context):
     if run_requests:
         context.log.info("训练触发：%s", ", ".join(rr.tags["job_id"] for rr in run_requests))
     return SensorResult(run_requests=run_requests, cursor=json.dumps(new_cursor))
-
-
-@sensor(
-    job=ingest_append_job,
-    minimum_interval_seconds=60,
-    default_status=DefaultSensorStatus.RUNNING,
-    description="卡死看护：running + claim 心跳超时 → failed，等待外部重新投递",
-)
-def platform_stuck_sensor(context):
-    """只收敛长时间卡住的执行；不自动重试。"""
-    from common.jobs import JOB_KINDS, watchdog_pass
-
-    summaries = []
-    for kind in JOB_KINDS:
-        counts = watchdog_pass(kind, context.log)
-        if any(counts.values()):
-            context.log.warning("%s 卡死看护：%s", kind.name, counts)
-            summaries.append(f"{kind.name}: 转 failed {counts['failed']}")
-    return SkipReason("；".join(summaries) if summaries else "没有卡住的任务")
 
 
 @sensor(job=annotation_collect_job, minimum_interval_seconds=30, default_status=DefaultSensorStatus.RUNNING)

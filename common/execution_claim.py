@@ -24,11 +24,13 @@ CREATE INDEX IF NOT EXISTS idx_execution_claim_heartbeat ON execution_claim (hea
 ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS last_dagster_run_id TEXT;
 ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS execution_attempt_count INT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_upload_session_last_run
     ON upload_session (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_dagster_run_id TEXT;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS execution_attempt_count INT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_platform_job_last_run
     ON platform_job (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;
 """

@@ -2,8 +2,30 @@
 ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS last_dagster_run_id TEXT;
 ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS execution_attempt_count INT NOT NULL DEFAULT 0;
+ALTER TABLE upload_session ADD COLUMN IF NOT EXISTS processing_type TEXT NOT NULL DEFAULT 'mcap_imu';
 CREATE INDEX IF NOT EXISTS idx_upload_session_last_run
     ON upload_session (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION freeze_ready_upload_manifest()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status IN ('ready', 'ingesting', 'done', 'failed')
+       AND (
+           NEW.manifest IS DISTINCT FROM OLD.manifest
+           OR NEW.manifest_uri IS DISTINCT FROM OLD.manifest_uri
+           OR NEW.manifest_op IS DISTINCT FROM OLD.manifest_op
+           OR NEW.processing_type IS DISTINCT FROM OLD.processing_type
+       ) THEN
+        RAISE EXCEPTION 'upload % manifest is frozen after ready', OLD.upload_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_freeze_ready_upload_manifest ON upload_session;
+CREATE TRIGGER trg_freeze_ready_upload_manifest
+BEFORE UPDATE ON upload_session
+FOR EACH ROW EXECUTE FUNCTION freeze_ready_upload_manifest();
 
 CREATE TABLE IF NOT EXISTS platform_job (
     job_id              TEXT PRIMARY KEY,
@@ -17,12 +39,14 @@ CREATE TABLE IF NOT EXISTS platform_job (
     last_execution_profile_id TEXT,
     last_error_code     TEXT,
     last_error          TEXT,
+    execution_attempt_count INT NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_dagster_run_id TEXT;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS execution_attempt_count INT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_platform_job_type_status ON platform_job (job_type, status);
 CREATE INDEX IF NOT EXISTS idx_platform_job_last_run
     ON platform_job (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;

@@ -18,11 +18,32 @@ CREATE TABLE IF NOT EXISTS upload_session (
     last_execution_profile_id TEXT,
     last_error_code     TEXT,
     last_error          TEXT,
+    execution_attempt_count INT NOT NULL DEFAULT 0 CHECK (execution_attempt_count >= 0),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_upload_session_last_run
     ON upload_session (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION freeze_ready_upload_manifest()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status IN ('ready', 'ingesting', 'done', 'failed')
+       AND (
+           NEW.manifest IS DISTINCT FROM OLD.manifest
+           OR NEW.manifest_uri IS DISTINCT FROM OLD.manifest_uri
+           OR NEW.manifest_op IS DISTINCT FROM OLD.manifest_op
+           OR NEW.processing_type IS DISTINCT FROM OLD.processing_type
+       ) THEN
+        RAISE EXCEPTION 'upload % manifest is frozen after ready', OLD.upload_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_freeze_ready_upload_manifest ON upload_session;
+CREATE TRIGGER trg_freeze_ready_upload_manifest
+BEFORE UPDATE ON upload_session
+FOR EACH ROW EXECUTE FUNCTION freeze_ready_upload_manifest();
 
 -- 通用异步任务状态机（README 3.1.2.1 / 3.7.4）：job_type 区分类型（MVP 只有
 -- training），payload/result JSONB 装类型专属字段，协议层（common/jobs.py）不解释。
@@ -39,6 +60,7 @@ CREATE TABLE IF NOT EXISTS platform_job (
     last_execution_profile_id TEXT,
     last_error_code     TEXT,
     last_error          TEXT,
+    execution_attempt_count INT NOT NULL DEFAULT 0 CHECK (execution_attempt_count >= 0),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );

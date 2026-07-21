@@ -66,11 +66,11 @@ class TrainingFailed(Exception):
 def run_training(job_id: str, op_context) -> dict:
     run_id = op_context.run_id
     row = fetch_one(
-        "SELECT * FROM platform_job WHERE job_id = %s AND job_type = 'training' AND status <> 'done'",
+        "SELECT * FROM platform_job WHERE job_id = %s AND job_type = 'training' AND status = 'ready'",
         (job_id,),
     )
     if row is None:
-        logger.info("job %s 不存在/已 done，跳过（UI Re-execute 的幂等路径）", job_id)
+        logger.info("job %s 不存在或非 ready，跳过旧消息/UI Re-execute", job_id)
         return {"status": "skipped", "job_id": job_id}
 
     processing_type = (row["payload"] or {}).get("processing_type", "training_mock")
@@ -80,15 +80,20 @@ def run_training(job_id: str, op_context) -> dict:
         claimed = claim.acquire_many(conn=conn)
         if not claimed:
             return {"status": "skipped", "job_id": job_id, "reason": "被另一个活跃 run 持有"}
-        conn.execute(
+        started = conn.execute(
             """
             UPDATE platform_job SET status = 'running', last_dagster_run_id = %s,
                 last_execution_profile_id = %s,
+                execution_attempt_count = execution_attempt_count + 1,
                 last_error_code = NULL, last_error = NULL, updated_at = now()
-            WHERE job_id = %s
+            WHERE job_id = %s AND status = 'ready'
+            RETURNING job_id
             """,
             (run_id, definition.profile.profile_id, job_id),
-        )
+        ).fetchone()
+        if started is None:
+            claim.release_many([job_id], conn=conn)
+            return {"status": "skipped", "job_id": job_id, "reason": "状态已不再是 ready"}
     try:
         result = _execute(row, claim, run_id, definition)
     except TrainingFailed as e:

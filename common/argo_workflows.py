@@ -86,6 +86,22 @@ def _custom_api():
     return kubernetes.client.CustomObjectsApi()
 
 
+def workflow_phases_for_run(run_id: str) -> dict[str, str | None]:
+    """查询某个 Dagster run 仍可见的 Argo Workflow 及 phase，供 reconciliation 使用。"""
+    api = _custom_api()
+    result = api.list_namespaced_custom_object(
+        GROUP,
+        VERSION,
+        settings.k8s_namespace,
+        PLURAL,
+        label_selector=f"dagster-run-id={run_id[:63]}",
+    )
+    return {
+        item.get("metadata", {}).get("name", "<unknown>"): (item.get("status") or {}).get("phase")
+        for item in result.get("items", [])
+    }
+
+
 def _workflow_name(run_id: str, specs: list[WorkerSpec]) -> str:
     digest = hashlib.sha1(",".join(sorted(s.upload_id for s in specs)).encode()).hexdigest()[:6]
     return f"edp-{run_id[:8]}-{digest}".lower()

@@ -62,6 +62,7 @@ class SessionStatusResponse(BaseModel):
     last_execution_profile_id: str | None = None
     last_error_code: str | None = None
     last_error: str | None = None
+    execution_attempt_count: int = 0
 
 
 class DatasetRequestIn(BaseModel):
@@ -134,6 +135,7 @@ class TrainJobOut(BaseModel):
     result: dict = Field(default_factory=dict)
     last_dagster_run_id: str | None = None
     last_execution_profile_id: str | None = None
+    execution_attempt_count: int = 0
     error_code: str | None = None
     error: str | None = None
 

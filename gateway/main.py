@@ -8,9 +8,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 
@@ -107,6 +107,11 @@ def get_session(upload_id: str) -> SessionStatusResponse:
 @app.post("/sessions/{upload_id}/presign", response_model=PresignResponse)
 def presign_upload(upload_id: str, req: PresignRequest) -> PresignResponse:
     session = _get_session_or_404(upload_id)
+    if session["status"] not in ("created", "uploading"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"manifest 已冻结；当前状态 '{session['status']}' 不允许继续上传文件",
+        )
     key = f"{object_store.PREFIX_RAW}/{session['robot_id']}/{upload_id}/{req.file_name}"
     url = object_store.presigned_put_url(key)
     if session["status"] == "created":
@@ -130,24 +135,42 @@ def submit_manifest(upload_id: str, req: ManifestSubmitRequest) -> dict:
         "manifest_op": session["manifest_op"],
         "processing_type": session["processing_type"],
     }
-    execute(
+    if session["status"] == "ready" and session.get("manifest") == manifest_payload:
+        emit_ingest_request(upload_id, session["manifest_op"], session["processing_type"])
+        return {
+            "upload_id": upload_id,
+            "status": "ready",
+            "manifest_op": session["manifest_op"],
+            "processing_type": session["processing_type"],
+        }
+    if session["status"] not in ("created", "uploading"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"manifest 在进入 ready 后冻结；当前状态为 '{session['status']}'，请创建新 upload",
+        )
+
+    manifest_bytes = to_json(manifest_payload).encode("utf-8")
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_key = (
+        f"{object_store.PREFIX_RAW}/{session['robot_id']}/{upload_id}/"
+        f"manifest-{manifest_hash}.json"
+    )
+    object_store.put_bytes(manifest_key, manifest_bytes)
+    updated = fetch_one(
         """
         UPDATE upload_session
         SET status = 'ready', manifest = %(manifest)s, manifest_uri = %(manifest_uri)s, updated_at = now()
-        WHERE upload_id = %(upload_id)s
+        WHERE upload_id = %(upload_id)s AND status IN ('created', 'uploading')
+        RETURNING upload_id
         """,
         {
             "manifest": to_json(manifest_payload),
-            "manifest_uri": object_store.object_uri(
-                f"{object_store.PREFIX_RAW}/{session['robot_id']}/{upload_id}/manifest.json"
-            ),
+            "manifest_uri": object_store.object_uri(manifest_key),
             "upload_id": upload_id,
         },
     )
-    object_store.put_bytes(
-        f"{object_store.PREFIX_RAW}/{session['robot_id']}/{upload_id}/manifest.json",
-        to_json(manifest_payload).encode("utf-8"),
-    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="会话状态已变化，manifest 未提交")
     emit("manifest.submitted", key=upload_id, payload=manifest_payload)
     # 触发事件：ingest_kafka_sensor 消费这条消息拉起对应 job。发失败也没关系——
     # session 已是 ready，T+1 兜底 schedule 会补触发；重复消息由引擎薄 claim 去重。
@@ -194,6 +217,7 @@ def retry_session(upload_id: str) -> dict:
         "previous_run_id": result["previous_run_id"],
         "previous_error_code": result["previous_error_code"],
         "previous_error": result["previous_error"],
+        "execution_attempt_count": result["execution_attempt_count"],
     }
 
 
@@ -312,6 +336,7 @@ def get_training_job(job_id: str) -> TrainJobOut:
         result=row["result"],
         last_dagster_run_id=row.get("last_dagster_run_id"),
         last_execution_profile_id=row.get("last_execution_profile_id"),
+        execution_attempt_count=row.get("execution_attempt_count", 0),
         error_code=row.get("last_error_code"),
         error=row.get("last_error"),
     )

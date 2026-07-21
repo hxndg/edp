@@ -15,9 +15,9 @@ pod fan-out 形态（README 3.6.3，讲解见 docs/pod-fanout-guide.md）：run 
 Argo 管 task 重试、OOM 内存升档和节点终态；Dagster 等整批 Workflow 结束，
 提交成功产物到 Iceberg，最后一次性写 PG 业务终态。
 
-**以 PG 状态为起点**：本函数只处理 status ≠ done 的 session。这让 Dagster UI 的
-Re-execute（run_config 里的 upload_ids 原样重放）天然安全——已成功的 upload
-被廉价跳过，只重跑失败/悬置的那部分。
+**以 PG 状态为起点**：本函数只处理 status = ready 的 session。Kafka 重放、
+Dagster UI Re-execute 和仍在 ingesting/已经 failed 的 upload 都会被跳过；
+失败任务必须先通过显式 retry 将业务状态 CAS 回 ready。
 """
 from __future__ import annotations
 
@@ -67,29 +67,34 @@ def run_batch(upload_ids: list[str], processing_type: str, op_context) -> dict:
             """
             SELECT * FROM upload_session
             WHERE upload_id = ANY(%s) AND manifest_op = 'append'
-              AND processing_type = %s AND status <> 'done'
+              AND processing_type = %s AND status = 'ready'
             """,
             (list(upload_ids), processing_type),
         )
     }
     not_pending = [uid for uid in upload_ids if uid not in sessions]
     if not_pending:
-        logger.info("跳过不存在/非 append/已 done 的 upload：%s", not_pending)
+        logger.info("跳过不存在/非 append/非 ready 的 upload：%s", not_pending)
 
     batch = ClaimBatch(SCOPE, list(sessions), run_id)
     with transaction() as conn:
         claimed = batch.acquire_many(conn=conn)
         if claimed:
-            conn.execute(
+            started = conn.execute(
                 """
                 UPDATE upload_session
                 SET status = 'ingesting', last_dagster_run_id = %s,
                     last_execution_profile_id = %s,
+                    execution_attempt_count = execution_attempt_count + 1,
                     last_error_code = NULL, last_error = NULL, updated_at = now()
-                WHERE upload_id = ANY(%s)
+                WHERE upload_id = ANY(%s) AND status = 'ready'
+                RETURNING upload_id
                 """,
                 (run_id, definition.profile.profile_id, claimed),
-            )
+            ).fetchall()
+            started_ids = [row["upload_id"] for row in started]
+            batch.release_many([uid for uid in claimed if uid not in started_ids], conn=conn)
+            claimed = started_ids
     skipped = [uid for uid in sessions if uid not in claimed]
 
     try:

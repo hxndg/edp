@@ -42,7 +42,8 @@ class ErrorCode(str, Enum):
     # ---- run 侧自身 ----
     COMMIT_CONFLICT = "COMMIT_CONFLICT"        # Iceberg commit 冲突/失败（整批级）
     PG_ERROR = "PG_ERROR"                      # platform 库不可达（整批级）
-    STUCK_EXHAUSTED = "STUCK_EXHAUSTED"        # 心跳超时且自动重试次数耗尽（stuck sensor 落的）
+    EXECUTION_LOST = "EXECUTION_LOST"          # reconciliation 确认 Dagster/Argo 均不再活跃
+    STUCK_EXHAUSTED = "STUCK_EXHAUSTED"        # 兼容升级前的历史记录
     INTERNAL = "INTERNAL"                      # 兜底：未分类异常
 
 
@@ -56,6 +57,7 @@ RETRY_POLICY: dict[ErrorCode, Retry] = {
     ErrorCode.WORKER_LOST: Retry.RETRYABLE,
     ErrorCode.COMMIT_CONFLICT: Retry.RETRYABLE,
     ErrorCode.PG_ERROR: Retry.RETRYABLE,
+    ErrorCode.EXECUTION_LOST: Retry.NOT_RETRYABLE,
     ErrorCode.STUCK_EXHAUSTED: Retry.NOT_RETRYABLE,
     ErrorCode.INTERNAL: Retry.RETRYABLE,
 }

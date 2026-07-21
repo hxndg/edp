@@ -22,17 +22,18 @@ from orchestration.jobs import (
     ingest_correct_job,
     model_training_job,
 )
+from orchestration.reconciliation import reconciliation_job
 from orchestration.retention import retention_job
 from orchestration.schedules import (
     compaction_schedule,
     ingest_append_fallback_schedule,
     ingest_correct_fallback_schedule,
+    reconciliation_schedule,
     retention_schedule,
 )
 from orchestration.sensors import (
     annotation_collect_sensor,
     ingest_kafka_sensor,
-    platform_stuck_sensor,
     training_kafka_sensor,
 )
 
@@ -59,13 +60,15 @@ defs = Definitions(
         model_training_job,
         analytics_job,
         compaction_job,
+        reconciliation_job,
         retention_job,
     ],
     schedules=[
         ingest_append_fallback_schedule,
         ingest_correct_fallback_schedule,
         compaction_schedule,
+        reconciliation_schedule,
         retention_schedule,
     ],
-    sensors=[ingest_kafka_sensor, training_kafka_sensor, platform_stuck_sensor, annotation_collect_sensor],
+    sensors=[ingest_kafka_sensor, training_kafka_sensor, annotation_collect_sensor],
 )

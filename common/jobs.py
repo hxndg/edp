@@ -1,4 +1,4 @@
-"""通用业务状态、人工重试与卡死 claim 看护。"""
+"""通用业务状态、人工重试与跨 Dagster/Argo 执行对账。"""
 from __future__ import annotations
 
 import threading
@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS platform_job (
     last_dagster_run_id TEXT,
     last_error_code     TEXT,
     last_error          TEXT,
+    execution_attempt_count INT NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -32,6 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_platform_job_type_status ON platform_job (job_typ
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_dagster_run_id TEXT;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE platform_job ADD COLUMN IF NOT EXISTS execution_attempt_count INT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_platform_job_last_run
     ON platform_job (last_dagster_run_id) WHERE last_dagster_run_id IS NOT NULL
 """
@@ -58,7 +60,7 @@ class JobKind:
 
     table/id_col/状态名是**受信任的内部常量**（拼进 SQL 的只有这些字段，
     业务值全部走参数绑定）。scope_sql 是能在状态表行上下文里求值的 SQL
-    表达式（如 `'ingest_' || manifest_op`），watchdog 用它 join execution_claim。
+    表达式（如 `'ingest_' || manifest_op`），reconciliation 用它 join execution_claim。
     """
 
     name: str                              # 注册键，也用于日志/alert source
@@ -168,16 +170,21 @@ def manual_retry(kind: JobKind, business_id: str) -> dict:
         "previous_run_id": row.get("last_dagster_run_id"),
         "previous_error_code": row.get("last_error_code"),
         "previous_error": row.get("last_error"),
+        "execution_attempt_count": row.get("execution_attempt_count", 0),
     }
 
 
 # ---------------------------------------------------------------------------
-# watchdog：只处理「running + 心跳超时」的卡死任务；其它重试靠 Kafka 再投递
-# （gateway manual_retry / 业务侧 emit；ready 丢消息靠 T+1 schedule 扫 PG）
+# reconciliation：心跳过期只是候选条件；必须再确认 Dagster run 与 Argo
+# Workflow 都不活跃，才把业务态收敛为 failed。此处绝不自动投 Kafka。
 # ---------------------------------------------------------------------------
 
-def watchdog_pass(kind: JobKind, log) -> dict[str, int]:
-    """心跳超时的运行任务转 failed 并释放 claim；重试必须由外部明确触发。"""
+def reconciliation_pass(kind: JobKind, instance, log, *, workflow_observer=None) -> dict[str, int]:
+    """核对 stale claim 的两层执行事实；确认执行消失后转 failed 并告警。"""
+    if workflow_observer is None:
+        from common.argo_workflows import workflow_phases_for_run
+
+        workflow_observer = workflow_phases_for_run
     _ensure_table()
     ensure_claim_schema()
     takeover = settings.claim_takeover_minutes
@@ -192,8 +199,41 @@ def watchdog_pass(kind: JobKind, log) -> dict[str, int]:
         """,
         (kind.running, takeover),
     )
-    failed = 0
+    counts = {"candidates": len(stale), "active": 0, "failed": 0, "observation_errors": 0}
     for row in stale:
+        run_id = row["claim_run_id"]
+        try:
+            dagster_run = instance.get_run_by_id(run_id)
+            dagster_status = (
+                getattr(getattr(dagster_run, "status", None), "value", None)
+                if dagster_run is not None
+                else None
+            )
+            workflows = workflow_observer(run_id)
+        except Exception as exc:  # noqa: BLE001 - 看不清执行事实时宁可保留 claim
+            counts["observation_errors"] += 1
+            log.exception(
+                "reconciliation 无法观测 %s %s（run=%s），本轮不改状态：%s",
+                kind.name,
+                row[kind.id_col],
+                run_id,
+                exc,
+            )
+            continue
+
+        dagster_active = dagster_status in {"STARTING", "STARTED", "CANCELING"}
+        argo_active = any(phase not in {"Succeeded", "Failed", "Error"} for phase in workflows.values())
+        if dagster_active or argo_active:
+            counts["active"] += 1
+            log.info(
+                "reconciliation 保留活跃任务 %s %s：Dagster=%s, Argo=%s",
+                kind.name,
+                row[kind.id_col],
+                dagster_status,
+                workflows,
+            )
+            continue
+
         with transaction() as conn:
             deleted = conn.execute(
                 """
@@ -206,29 +246,46 @@ def watchdog_pass(kind: JobKind, log) -> dict[str, int]:
             ).fetchone()
             if deleted is None:
                 continue
-            message = "执行租约心跳超时，已终止；如需重试请重新投递 Kafka"
-            conn.execute(
+            message = (
+                f"claim 心跳超时且执行已消失：Dagster={dagster_status or 'missing'}, "
+                f"Argo={workflows or 'missing'}；系统未自动重试，请检查后人工 retry"
+            )
+            updated = conn.execute(
                 f"""
                 UPDATE {kind.table}
-                SET status = %s, last_error_code = 'STUCK_EXHAUSTED',
+                SET status = %s, last_error_code = 'EXECUTION_LOST',
                     last_error = %s, updated_at = now()
-                WHERE {kind.id_col} = %s AND status = %s
+                WHERE {kind.id_col} = %s AND status = %s AND last_dagster_run_id = %s
+                RETURNING {kind.id_col}
                 """,
-                (kind.failed, message, row[kind.id_col], kind.running),
-            )
+                (kind.failed, message, row[kind.id_col], kind.running, run_id),
+            ).fetchone()
+            if updated is None:
+                continue
             conn.execute(
                 """
                 INSERT INTO alerts (severity, source, run_id, message, context)
                 VALUES ('error', %s, %s, %s, %s)
                 """,
                 (
-                    f"{kind.name}_watchdog",
-                    row["claim_run_id"],
-                    f"{kind.name} {row[kind.id_col]} 执行租约心跳超时",
-                    to_json({"id": row[kind.id_col], "scope": row["claim_scope"]}),
+                    f"{kind.name}_reconciliation",
+                    run_id,
+                    f"{kind.name} {row[kind.id_col]} 执行已消失",
+                    to_json({
+                        "id": row[kind.id_col],
+                        "scope": row["claim_scope"],
+                        "dagster_status": dagster_status,
+                        "argo_workflows": workflows,
+                        "execution_attempt_count": row.get("execution_attempt_count", 0),
+                    }),
                 ),
             )
-            failed += 1
-            log.warning("卡死终止 %s %s → failed", kind.name, row[kind.id_col])
+            counts["failed"] += 1
+            log.warning(
+                "reconciliation 确认执行消失：%s %s → failed（attempt=%s）",
+                kind.name,
+                row[kind.id_col],
+                row.get("execution_attempt_count", 0),
+            )
 
-    return {"failed": failed}
+    return counts

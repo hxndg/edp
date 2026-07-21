@@ -46,7 +46,8 @@ SCOPE = "ingest_correct"
 
 def run_batch(upload_ids: list[str], processing_type: str, op_context) -> dict:
     """薄 claim + Argo + 最终批量落态，与 ingest_append.run_batch 同构。
-    同样以 PG 状态为起点：status = done 的 upload 廉价跳过，Re-execute 安全。"""
+    同样以 PG 状态为起点：只有 status = ready 的 upload 可执行；failed 必须先
+    经过显式 retry，Kafka 重放和 UI Re-execute 不会绕过业务状态。"""
     run_id = op_context.run_id
     definition = resolve_processing_type(processing_type, expected_kind="ingest")
     sessions = {
@@ -55,29 +56,34 @@ def run_batch(upload_ids: list[str], processing_type: str, op_context) -> dict:
             """
             SELECT * FROM upload_session
             WHERE upload_id = ANY(%s) AND manifest_op = 'correct'
-              AND processing_type = %s AND status <> 'done'
+              AND processing_type = %s AND status = 'ready'
             """,
             (list(upload_ids), processing_type),
         )
     }
     not_pending = [uid for uid in upload_ids if uid not in sessions]
     if not_pending:
-        logger.info("跳过不存在/非 correct/已 done 的 upload：%s", not_pending)
+        logger.info("跳过不存在/非 correct/非 ready 的 upload：%s", not_pending)
 
     batch = ClaimBatch(SCOPE, list(sessions), run_id)
     with transaction() as conn:
         claimed = batch.acquire_many(conn=conn)
         if claimed:
-            conn.execute(
+            started = conn.execute(
                 """
                 UPDATE upload_session
                 SET status = 'ingesting', last_dagster_run_id = %s,
                     last_execution_profile_id = %s,
+                    execution_attempt_count = execution_attempt_count + 1,
                     last_error_code = NULL, last_error = NULL, updated_at = now()
-                WHERE upload_id = ANY(%s)
+                WHERE upload_id = ANY(%s) AND status = 'ready'
+                RETURNING upload_id
                 """,
                 (run_id, definition.profile.profile_id, claimed),
-            )
+            ).fetchall()
+            started_ids = [row["upload_id"] for row in started]
+            batch.release_many([uid for uid in claimed if uid not in started_ids], conn=conn)
+            claimed = started_ids
     skipped = [uid for uid in sessions if uid not in claimed]
 
     try:

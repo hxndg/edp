@@ -6,6 +6,7 @@ from dagster import DefaultScheduleStatus, RunRequest, ScheduleEvaluationContext
 from common.runtime_config import get_int
 from orchestration.compaction import compaction_job
 from orchestration.jobs import ingest_append_job, ingest_correct_job
+from orchestration.reconciliation import reconciliation_job
 from orchestration.retention import retention_job
 from orchestration.sensors import _batch_run_request, _pending_upload_rows
 
@@ -52,6 +53,16 @@ def ingest_append_fallback_schedule(context: ScheduleEvaluationContext):
 )
 def ingest_correct_fallback_schedule(context: ScheduleEvaluationContext):
     yield from _fallback_run_requests(context, "correct")
+
+
+@schedule(
+    job=reconciliation_job,
+    cron_schedule="*/5 * * * *",
+    default_status=DefaultScheduleStatus.RUNNING,
+    description="每 5 分钟核对 stale claim 的 Dagster/Argo 状态；只告警并落 failed，不自动重试",
+)
+def reconciliation_schedule(context: ScheduleEvaluationContext):
+    return RunRequest()
 
 
 @schedule(
